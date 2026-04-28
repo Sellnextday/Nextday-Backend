@@ -9,13 +9,26 @@ app.use(express.json());
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
 app.post('/analyze', async (req, res) => {
-  const { prompt } = req.body;
+  const { prompt, system } = req.body;
   try {
-    const url = 'https://api.anthropic.com/v1/messages';
-    const headers = { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
-    const result = await axios({method:'post', url, data:prompt, headers});
-    res.json(result.data);
+    const result = await axios({
+      method: 'post',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json'
+      },
+      data: {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4096,
+        system: system,
+        messages: [{ role: 'user', content: prompt }]
+      }
+    });
+    res.json({ response: result.data.content[0].text });
   } catch (err) {
+    console.error(err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
