@@ -19,7 +19,7 @@ app.post('/analyze', async (req, res) => {
       'Content-Type': 'application/json'
     };
     const result = await axios({method:'post', url, data:prompt, headers});
-    res.json(result.data);
+  res.json(result.data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
