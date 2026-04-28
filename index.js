@@ -1,4 +1,3 @@
-
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -13,13 +12,9 @@ app.post('/analyze', async (req, res) => {
   const { prompt } = req.body;
   try {
     const url = 'https://api.anthropic.com/v1/messages';
-    const headers = {
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json'
-    };
+    const headers = { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
     const result = await axios({method:'post', url, data:prompt, headers});
-  res.jsonresult.data;
+    res.json(result.data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
