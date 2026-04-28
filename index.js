@@ -7,31 +7,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const BL_KEY = process.env.BATCHLEADS_API_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
-app.post('/property', async (req, res) => {
-  const { address } = req.body;
+app.post('/analyze', async (req, res) => {
+  const { prompt } = req.body;
   try {
-    const response = await axios.post(
-      'https://api.batchleads.io/v1/property/search',
-      { address },
-      { headers: { 'x-api-key': BL_KEY, 'Content-Type': 'application/json' } }
-    );
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/comps', async (req, res) => {
-  const { address, radius, beds, baths } = req.body;
-  try {
-    const response = await axios.post(
-      'https://api.batchleads.io/v1/comps/search',
-      { address, radius: radius || 1, beds, baths },
-      { headers: { 'x-api-key': BL_KEY, 'Content-Type': 'application/json' } }
-    );
-    res.json(response.data);
+    const url = 'https://api.anthropic.com/v1/messages';
+    const headers = {
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json'
+    };
+    const result = await axios({method:'post', url, data:prompt, headers});
+    res.json(result.data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
