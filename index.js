@@ -7,8 +7,6 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = 'claude-sonnet-4-6';
-const MAX_TOKENS = 8000;
 
 function extractJSON(text) {
   text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -22,12 +20,10 @@ app.post('/analyze', async (req, res) => {
 
   try {
     let messages = [{ role: 'user', content: prompt }];
-    let iterationCount = 0;
-    const MAX_ITERATIONS = 10;
+    let searchCount = 0;
+    const MAX_SEARCHES = 4;
 
-    while (iterationCount < MAX_ITERATIONS) {
-      iterationCount++;
-
+    while (true) {
       const response = await axios({
         method: 'post',
         url: 'https://api.anthropic.com/v1/messages',
@@ -37,52 +33,55 @@ app.post('/analyze', async (req, res) => {
           'Content-Type': 'application/json'
         },
         data: {
-          model: MODEL,
-          max_tokens: MAX_TOKENS,
+          model: 'claude-sonnet-4-6',
+          max_tokens: 4096,
           system: system,
           tools: [{ type: 'web_search_20250305', name: 'web_search' }],
           messages: messages
         }
       });
 
-      const data = response.data;
-      const stopReason = data.stop_reason;
-      const content = data.content;
+      const stopReason = response.data.stop_reason;
+      const content = response.data.content;
 
-      console.log('Iteration ' + iterationCount + ', stop_reason: ' + stopReason);
-
+      console.log('stop_reason:', stopReason, '| searches used:', searchCount);
       messages.push({ role: 'assistant', content: content });
 
       if (stopReason === 'end_turn') {
         const textBlock = content.find(function(b) { return b.type === 'text'; });
         if (textBlock) {
-          const jsonText = extractJSON(textBlock.text);
-          return res.json({ response: jsonText });
+          return res.json({ response: extractJSON(textBlock.text) });
         }
         return res.status(500).json({ error: 'No text in response' });
       }
 
       if (stopReason === 'tool_use') {
         const toolUseBlocks = content.filter(function(b) { return b.type === 'tool_use'; });
-        console.log('Tools called: ' + toolUseBlocks.map(function(b) { return b.name; }).join(', '));
+        searchCount += toolUseBlocks.length;
 
-        const toolResults = toolUseBlocks.map(function(block) {
-          return {
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: block.content || ''
-          };
-        });
-
-        messages.push({ role: 'user', content: toolResults });
+        // If too many searches, force Claude to stop and return what it has
+        if (searchCount >= MAX_SEARCHES) {
+          messages.push({
+            role: 'user',
+            content: toolUseBlocks.map(function(block) {
+              return { type: 'tool_result', tool_use_id: block.id, content: 'Search limit reached. Use the data already gathered to produce the final JSON response now.' };
+            })
+          });
+        } else {
+          messages.push({
+            role: 'user',
+            content: toolUseBlocks.map(function(block) {
+              return { type: 'tool_result', tool_use_id: block.id, content: block.content || '' };
+            })
+          });
+        }
         continue;
       }
 
-      console.log('Unexpected stop_reason:', stopReason);
       break;
     }
 
-    return res.status(500).json({ error: 'Max iterations reached without final response' });
+    return res.status(500).json({ error: 'Unexpected end of loop' });
 
   } catch (err) {
     const errMsg = (err.response && err.response.data && err.response.data.error && err.response.data.error.message) || err.message;
