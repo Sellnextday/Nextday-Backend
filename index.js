@@ -9,10 +9,15 @@ app.use(express.json({ limit: '10mb' }));
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
 function extractJSON(text) {
-  text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-  const match = text.match(/\{[\s\S]*"property_address"[\s\S]*\}/);
-  if (match) return match[0];
-  return text;
+  // Remove markdown fences
+  text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+  // Find first { and last } to extract JSON block
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first !== -1 && last !== -1 && last > first) {
+    return text.substring(first, last + 1);
+  }
+  return text.trim();
 }
 
 app.post('/analyze', async (req, res) => {
@@ -50,7 +55,19 @@ app.post('/analyze', async (req, res) => {
       if (stopReason === 'end_turn') {
         const textBlock = content.find(function(b) { return b.type === 'text'; });
         if (textBlock) {
-          return res.json({ response: extractJSON(textBlock.text) });
+          const jsonStr = extractJSON(textBlock.text);
+          // Validate it parses before sending
+          try {
+            JSON.parse(jsonStr);
+            return res.json({ response: jsonStr });
+          } catch(parseErr) {
+            // If JSON is invalid, ask Claude to fix it
+            messages.push({
+              role: 'user',
+              content: 'Your response was not valid JSON. Return ONLY the raw JSON object with no text before or after it, no markdown, no explanation. Just the { } JSON block.'
+            });
+            continue;
+          }
         }
         return res.status(500).json({ error: 'No text in response' });
       }
@@ -59,19 +76,26 @@ app.post('/analyze', async (req, res) => {
         const toolUseBlocks = content.filter(function(b) { return b.type === 'tool_use'; });
         searchCount += toolUseBlocks.length;
 
-        // If too many searches, force Claude to stop and return what it has
         if (searchCount >= MAX_SEARCHES) {
           messages.push({
             role: 'user',
             content: toolUseBlocks.map(function(block) {
-              return { type: 'tool_result', tool_use_id: block.id, content: 'Search limit reached. Use the data already gathered to produce the final JSON response now.' };
+              return {
+                type: 'tool_result',
+                tool_use_id: block.id,
+                content: 'Search limit reached. Using data gathered so far. Now output ONLY the raw JSON object — no text, no markdown, no explanation before or after.'
+              };
             })
           });
         } else {
           messages.push({
             role: 'user',
             content: toolUseBlocks.map(function(block) {
-              return { type: 'tool_result', tool_use_id: block.id, content: block.content || '' };
+              return {
+                type: 'tool_result',
+                tool_use_id: block.id,
+                content: block.content || ''
+              };
             })
           });
         }
