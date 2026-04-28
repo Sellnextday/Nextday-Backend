@@ -7,7 +7,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = 'claude-haiku-4-5-20251001';
+const MODEL = 'claude-sonnet-4-6';
 const MAX_TOKENS = 8192;
 const MAX_ITERATIONS = 15;
 
