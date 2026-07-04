@@ -1,524 +1,176 @@
-const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+/**
+ * JARVIS — Slack body (Cloudflare Worker)
+ *
+ * A thin forwarder: DM or @mention JARVIS → forwards to the shared brain
+ * (via the BRAIN service binding) and posts his reply. The BRAIN itself now
+ * has a post_to_slack tool, so JARVIS decides — conversationally — when to post
+ * to a channel. We just tell the brain whether the asker is Chris (canAct), so
+ * only Chris can make him take actions; everyone else gets answers only.
+ *
+ * Secrets:  SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN
+ * Binding:  BRAIN -> service "jarvis"   (Worker→Worker by URL is blocked, error 1042)
+ */
 
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-const ATTOM_KEY = process.env.ATTOM_API_KEY;
-const MODEL = 'claude-sonnet-4-6';
-const MAX_TOKENS = 8192;
-const MAX_ITERATIONS = 15;
+const CHRIS = 'U0A75DYD4D6';
+const JARVIS_ASK_URL = 'https://jarvis.twilight-tree-d5c3.workers.dev/ask';
 
-// ─────────────────────────────────────────────
-// ATTOM HELPERS
-// ─────────────────────────────────────────────
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method !== 'POST') return new Response('JARVIS Slack body online. POST only.', { status: 200 });
 
-async function attomPropertyDetail(address1, address2) {
-  let res;
+    const body = await request.text();
+    let data = null;
+    try { data = JSON.parse(body); } catch (e) {}
+
+    if (data && data.type === 'url_verification') {
+      return new Response(data.challenge || '', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+    }
+    if (request.headers.get('x-slack-retry-num')) return new Response('', { status: 200 });
+    if (!(await verifySlackSignature(request, body, env.SLACK_SIGNING_SECRET))) return new Response('bad signature', { status: 401 });
+
+    if (data && data.type === 'event_callback' && data.event) {
+      const ev = data.event;
+      if (ev.bot_id || ev.subtype) return new Response('', { status: 200 });
+      const isMention = ev.type === 'app_mention';
+      const isDM = ev.type === 'message' && ev.channel_type === 'im';
+      if (isMention || isDM) {
+        const text = (ev.text || '').replace(/<@[^>]+>/g, '').trim();
+        const channel = ev.channel;
+        const thread = isMention ? (ev.thread_ts || ev.ts) : (ev.thread_ts || undefined);
+        const canAct = ev.user === CHRIS;
+        ctx.waitUntil(answerInSlack(text, channel, thread, canAct, env));
+      }
+      return new Response('', { status: 200 });
+    }
+    return new Response('ok', { status: 200 });
+  }
+};
+
+async function answerInSlack(text, channel, thread, canAct, env) {
+  let reply = "I didn't catch that, Boss.";
   try {
-    res = await axios.get(
-      'https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/detail',
-      {
-        headers: { apikey: ATTOM_KEY, Accept: 'application/json' },
-        params: { address1, address2 },
-        timeout: 15000
+    if (text) {
+
+      // ── JARVIS DEAL ANALYSIS ─────────────────────────────────────
+      // Detects a property address in the message and runs the
+      // 4-agent ATTOM pipeline on Render before hitting JARVIS brain.
+      const _isAddr = /^\s*\d{1,6}\s+[A-Za-z]/.test(text)
+        || /\b(run|analyze|comp|deal)\s+\d+\s+[A-Za-z]/i.test(text);
+      let _dealDone = false;
+
+      if (_isAddr) {
+        const _addrRx = /\d{1,6}\s+[\w\s#-]{0,50}?(?:st(?:reet)?|ave(?:nue)?|blvd|boulevard|dr(?:ive)?|rd|road|ln|lane|ct|court|way|pl(?:ace)?|cir(?:cle)?|ter(?:race)?|hwy|highway|pkwy|parkway)\b[^.!?\n]*/i;
+        const _addrHit = text.match(_addrRx);
+        const _addrStr = _addrHit ? _addrHit[0].trim() : text;
+
+        // Immediate ack — so Boss knows it's running even during Render cold start
+        await postToSlack(channel, thread, '🔍 On it — pulling comps for ' + _addrStr + '...', env);
+
+        try {
+          const _r = await fetch('https://nextday-backend.onrender.com/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address: _addrStr, callNotes: text })
+          });
+
+          if (_r.ok) {
+            const _j = await _r.json();
+            // Index v2.0 returns pre-formatted Slack text, or a needs_* prompt
+            if (_j.needs_sqft) {
+              reply = '📐 ' + _j.message;
+            } else if (_j.needs_info) {
+              reply = 'ℹ️ ' + _j.message;
+            } else if (typeof _j.response === 'string') {
+              reply = _j.response;
+            } else {
+              reply = '⚠️ Unexpected response from analyzer — check Render logs';
+            }
+          } else {
+            let _errDetail = '';
+            try { const _eb = await _r.json(); _errDetail = _eb.error || JSON.stringify(_eb); } catch(e) {}
+            reply = '⚠️ Analyzer error (' + _r.status + '): ' + (_errDetail || 'check Render logs');
+          }
+        } catch (_e) {
+          console.error('[DEAL]', _e && _e.message);
+          reply = '⚠️ Analyzer timed out — Render may be waking up. Send the address again in ~30 sec.';
+        }
+        _dealDone = true; // address was detected — don't fall through to JARVIS brain either way
       }
-    );
-  } catch (axiosErr) {
-    const status  = axiosErr.response?.status;
-    const detail  = axiosErr.response?.data?.status?.msg || axiosErr.response?.data?.message || axiosErr.message;
-    throw new Error(`ATTOM HTTP ${status || 'error'}: ${detail}`);
-  }
-  const prop = res.data.property?.[0];
-  if (!prop) {
-    const msg = res.data?.status?.msg || 'no property record returned';
-    throw new Error(`ATTOM: property not found — ${msg}`);
-  }
-  const sqft = prop.building?.size?.universalsize || prop.building?.size?.livingsize || null;
-  return {
-    address:       prop.address?.oneLine,
-    sqft:          sqft ? parseInt(sqft) : null,
-    beds:          prop.building?.rooms?.beds,
-    baths:         prop.building?.rooms?.bathstotal,
-    lotSize:       prop.lot?.lotsize1,
-    yearBuilt:     prop.summary?.yearbuilt,
-    lat:           parseFloat(prop.location?.latitude),
-    lon:           parseFloat(prop.location?.longitude),
-    lastSoldPrice: prop.sale?.amount?.saleamt   || null,
-    lastSoldDate:  prop.sale?.saleTransDate      || prop.sale?.salesearchdate || null,
-    propertyType:  prop.summary?.proptype        || null
-  };
-}
+      // ── END DEAL ANALYSIS ────────────────────────────────────────
 
-async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
-  const res = await axios.get(
-    'https://api.gateway.attomdata.com/propertyapi/v1.0.0/sale/snapshot',
-    {
-      headers: { apikey: ATTOM_KEY, Accept: 'application/json' },
-      params: {
-        latitude:   lat,
-        longitude:  lon,
-        radius:     radiusMiles,
-        minsqsize:  sqft - sqftBuffer,
-        maxsqsize:  sqft + sqftBuffer,
-        pagesize:   50
-      },
-      timeout: 15000
-    }
-  );
-
-  const props = res.data.property || [];
-
-  // 15-month hard stop — filter client-side using saleTransDate
-  const cutoff = new Date();
-  cutoff.setMonth(cutoff.getMonth() - 15);
-
-  return props
-    .filter(p => {
-      const saleDate = p.sale?.saleTransDate || p.sale?.salesearchdate;
-      if (!saleDate) return false;
-      if (new Date(saleDate) < cutoff) return false;
-      if (!p.sale?.amount?.saleamt) return false;          // must have a recorded sale price
-      if (!p.building?.size?.universalsize) return false;  // must have sqft
-      return true;
-    })
-    .map(p => ({
-      address:    p.address?.oneLine,
-      beds:       p.building?.rooms?.beds,
-      baths:      p.building?.rooms?.bathstotal,
-      sqft:       p.building?.size?.universalsize,
-      lotSize:    p.lot?.lotsize1,
-      salePrice:  p.sale?.amount?.saleamt,
-      saleDate:   p.sale?.saleTransDate || p.sale?.salesearchdate,
-      ppsf:       Math.round(p.sale.amount.saleamt / p.building.size.universalsize),
-      source:     'ATTOM (county recorded)'
-    }));
-}
-
-// Tiered expansion — mirrors the locked comp criteria
-async function pullCompsWithTiers(lat, lon, sqft) {
-  const tiers = [
-    { radius: 1,  sqftBuffer: 500  },
-    { radius: 2,  sqftBuffer: 750  },
-    { radius: 3,  sqftBuffer: 1000 },
-    { radius: 3,  sqftBuffer: 1500 }
-  ];
-
-  let comps = [];
-  let tierUsed = null;
-
-  for (const tier of tiers) {
-    comps = await attomSaleComps(lat, lon, tier.radius, sqft, tier.sqftBuffer);
-    tierUsed = tier;
-    if (comps.length >= 3) break;
-  }
-
-  return { comps, tierUsed };
-}
-
-// ─────────────────────────────────────────────
-// JSON EXTRACTOR
-// ─────────────────────────────────────────────
-
-function extractJSON(raw) {
-  // ── Step 1: strip markdown code fences ──────────────────────────
-  let text = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
-
-  // ── Step 2: isolate the JSON object ─────────────────────────────
-  const first = text.indexOf('{');
-  const last  = text.lastIndexOf('}');
-  if (first !== -1 && last !== -1 && last > first) {
-    text = text.substring(first, last + 1);
-  } else {
-    text = text.trim();
-  }
-
-  // ── Step 3: remove JS-style single-line comments (// ...)
-  //            but NOT inside strings and NOT URLs (://)
-  text = text.replace(/^[ \t]*\/\/[^\n]*/gm, '');   // line-start only
-  text = text.replace(/([,{[\s])\/\/[^\n]*/g, '$1'); // after comma/brace
-
-  // ── Step 4: remove block comments /* ... */ ──────────────────────
-  text = text.replace(/\/\*[\s\S]*?\*\//g, '');
-
-  // ── Step 5: fix trailing commas before ] or } ────────────────────
-  text = text.replace(/,(\s*[}\]])/g, '$1');
-
-  // ── Step 6: fix unquoted keys  { key: → { "key": ────────────────
-  //            Only on word-char keys not already quoted
-  text = text.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*):/g, '$1"$2"$3:');
-
-  // ── Step 7: fix single-quoted strings → double-quoted ───────────
-  //            Simple heuristic — only when the value is clearly a string
-  text = text.replace(/'([^'\\]*(\\.[^'\\]*)*)'/g, '"$1"');
-
-  // ── Step 8: escape raw control characters inside string values ───
-  let result = '';
-  let inStr = false;
-  let esc = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    const code = text.charCodeAt(i);
-    if (esc)           { result += c; esc = false; continue; }
-    if (c === '\\' && inStr) { result += c; esc = true; continue; }
-    if (c === '"')     { result += c; inStr = !inStr; continue; }
-    if (inStr && code < 0x20) {
-      if (c === '\n')      result += '\\n';
-      else if (c === '\r') result += '\\r';
-      else if (c === '\t') result += '\\t';
-      else result += '\\u' + code.toString(16).padStart(4, '0');
-    } else {
-      result += c;
-    }
-  }
-  return result;
-}
-
-// ─────────────────────────────────────────────
-// SHARED AGENT RUNNER (no web search needed — data pre-loaded from ATTOM)
-// ─────────────────────────────────────────────
-
-async function runAgent(systemPrompt, userPrompt) {
-  let messages = [{ role: 'user', content: userPrompt }];
-  let iterations = 0;
-
-  while (iterations < MAX_ITERATIONS) {
-    iterations++;
-
-    const apiResponse = await axios({
-      method: 'post',
-      url: 'https://api.anthropic.com/v1/messages',
-      timeout: 180000,
-      headers: {
-        'x-api-key':         ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type':      'application/json'
-      },
-      data: {
-        model:      MODEL,
-        max_tokens: MAX_TOKENS,
-        system:     systemPrompt,
-        messages
+      if (!_dealDone) {
+        const history = await fetchHistory(channel, thread, env);
+        const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: text, canAct, history, channel: channel, threadTs: thread }) };
+        const r = (env.BRAIN && typeof env.BRAIN.fetch === 'function')
+          ? await env.BRAIN.fetch('https://brain/ask', init)
+          : await fetch(env.JARVIS_ASK_URL || JARVIS_ASK_URL, init);
+        const j = await r.json().catch(() => ({}));
+        reply = (j && j.text) ? String(j.text) : "My brain link dropped for a second, Boss — try me again.";
       }
+    }
+  } catch (e) {
+    reply = "My reasoning core hiccuped, Boss — give me another go.";
+  }
+  try {
+    const msg = { channel, text: reply };
+    if (thread) msg.thread_ts = thread;
+    await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + env.SLACK_BOT_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(msg)
     });
-
-    const stopReason = apiResponse.data.stop_reason;
-    const content    = apiResponse.data.content;
-    messages.push({ role: 'assistant', content });
-
-    if (stopReason === 'end_turn') {
-      const textBlock = content.find(b => b.type === 'text');
-      if (!textBlock?.text) throw new Error('Agent returned no text');
-      const jsonStr = extractJSON(textBlock.text);
-      JSON.parse(jsonStr); // validate — throws if bad
-      return JSON.parse(jsonStr);
-    }
-  }
-  throw new Error('Agent did not complete in max iterations');
+  } catch (e) {}
 }
 
-// ─────────────────────────────────────────────
-// SYSTEM PROMPTS
-// ─────────────────────────────────────────────
-
-const COMP_AGENT_SYSTEM = `You are the Comp Agent for Next Day Home Buyers LLC, a wholesale real estate company.
-
-You will receive:
-1. Subject property details pulled from ATTOM (county-recorded data)
-2. A list of candidate comparable sales pulled from ATTOM within the search radius
-3. Acquisition call notes from the seller conversation
-
-YOUR JOB: Evaluate the candidate comps against the locked comp criteria and identify the best qualifying ones. You are NOT searching the internet — the data is already in front of you.
-
-LOCKED COMP CRITERIA:
-- Bathrooms: within ±2 of subject
-- Square footage: within the tier buffer already applied (comps were pre-filtered)
-- Lot size: within 50% of subject lot size
-- Property type: stick-built only (unless subject is manufactured, then manufactured only)
-- Sold date: within 15 months of today — already filtered, but verify dates are reasonable
-- Exclude: distressed/foreclosure sales (price far below market), flips held < 90 days, non-arm's-length transactions
-
-COMP POOL RULES:
-- 3+ qualifying comps → run normally
-- 1–2 qualifying comps → flag 🟡 "LIMITED COMP DATA — verify manually"
-- 0 qualifying comps → flag 🔴 "Insufficient Comp Data — Run Manually"
-
-IMPORTANT: Always return verified: true regardless of comp count. Use data_quality_flag to communicate data issues. Never refuse to return a result.
-
-OUTPUT: Return a JSON object with this exact structure:
-{
-  "verified": true,
-  "qualifying_comps": [...],
-  "excluded_comps": [...with reason...],
-  "avg_ppsf": 0,
-  "median_dom": 0,
-  "comp_count": 0,
-  "tier_used": "...",
-  "data_quality_flag": null or "LIMITED COMP DATA" or "Insufficient Comp Data",
-  "subject_last_sold": { "price": 0, "date": "..." },
-  "active_listings": [],
-  "mls_cap_price": null
-}`;
-
-const DISCOUNT_AGENT_SYSTEM = `You are the Discount Agent for Next Day Home Buyers LLC.
-
-You will receive subject property details and acquisition call notes. Extract every condition mentioned and apply the locked discount table.
-
-LOCKED DISCOUNT TABLE:
-
-PER SQFT (minor / major):
-- HVAC old: $3 / $4 per sqft
-- Flooring replacement: $3 / $4 per sqft
-- Kitchen dated: $3 / $4 per sqft
-- Kitchen full update: $7 / $8 per sqft
-- Siding paint/minor: $1 / $2 per sqft
-- Siding full replacement: $3 / $5 per sqft
-
-FLAT DISCOUNTS (minor / major):
-- Foundation issues: $20,000 flat (both)
-- Roof 20yr+: $8,000 / $15,000
-- Original windows: $3,000 / $6,000
-- Water heater 12yr+: $1,000 / $2,500
-- Kitchen appliances: $4,000 flat (both)
-- Tenant occupied: $3,000 / $7,000
-- HOA over $150/mo: $4,000 / $8,000
-- Electrical old panel: $3,000 flat (both)
-- Knob & tube wiring: $8,000 flat (both)
-- Plumbing issues: $2,000 / $10,000
-
-PER BATH:
-- Bathrooms dated: $2,000 per bath
-- Bathrooms full update: $6,000 per bath
-
-RED FLAGS TO CHECK:
-- Deed issues (ex-spouse, trust, multiple owners, only one spouse on deed)
-- Active MLS or FSBO listing
-- Septic + well combination
-- Small market under 1,000 population
-- Roof 18yr+ (financing issues for end buyers)
-- Seller owes more than MAO (short sale needed)
-NOTE: Manufactured/mobile homes are NOT a red flag — we buy these.
-
-SELF-VERIFY: Before returning, confirm every condition from the notes is accounted for. Sum your discounts and verify the math. Always return verified: true — use unmatched_conditions for anything you couldn't map.
-
-OUTPUT: Return a JSON object:
-{
-  "verified": true,
-  "subject_sqft": 0,
-  "bath_count": 0,
-  "discounts": [
-    { "item": "...", "severity": "minor|major", "type": "per_sqft|flat|per_bath", "amount": 0 }
-  ],
-  "total_discount": 0,
-  "red_flags": [],
-  "occupancy": "owner|tenant|vacant",
-  "unmatched_conditions": []
-}`;
-
-const FORMULA_AGENT_SYSTEM = `You are the Formula Agent for Next Day Home Buyers LLC. You ALWAYS return a complete JSON result — never refuse, never return verified: false.
-
-IF COMP DATA IS AVAILABLE (avg_ppsf > 0):
-Run the locked 7-step formula:
-Step 1: Comp Avg $/sqft = average of qualifying comp $/sqft values
-Step 2: Retail ARV = Comp Avg $/sqft × Subject Sqft
-Step 3: As-Is Value = Retail ARV − Total Discount
-Step 4: List Price = As-Is Value × 0.90
-Step 5: MAO = List Price − (List Price × 0.05) − (List Price × 0.02) − $25,000
-        Anchor Price = MAO × 0.85
-Novation List Price = Retail ARV − $30,000
-Novation MAO = Novation List Price − (Novation List Price × 0.05) − (Novation List Price × 0.02) − $25,000
-MLS CAP RULE: If mls_cap_price exists → Wholesale MAO = MIN(calculated MAO, mls_cap_price)
-LIQUIDITY DISCOUNT: If median DOM ≥ 45 days → apply additional 3% discount to As-Is Value before formula
-
-IF NO COMP DATA (avg_ppsf = 0 or comp_count = 0):
-Set all dollar fields to 0. Set verdict to 🔴. Set verdict_reason to "Insufficient comp data — run manually". Still return verified: true.
-
-ROUNDING RULE: Round every dollar amount to the nearest whole dollar. No decimals.
-
-SELF-VERIFY: Re-derive MAO from scratch. Differences under $5 = match: true (rounding). Over $5 = recalculate.
-
-Step 6: Timeline = median DOM from comps, or "N/A" if no comps
-Step 7: Verdict = 🟢 Green / 🟡 Yellow / 🔴 Red — based on NUMBERS ONLY
-
-OUTPUT — always return this exact JSON:
-{
-  "verified": true,
-  "retail_arv": 0,
-  "total_discount": 0,
-  "liquidity_discount_applied": false,
-  "as_is_value": 0,
-  "list_price": 0,
-  "mao": 0,
-  "anchor_price": 0,
-  "novation_list_price": 0,
-  "novation_mao": 0,
-  "mls_cap_applied": false,
-  "timeline_days": "...",
-  "verdict": "🟢|🟡|🔴",
-  "verdict_reason": "...",
-  "self_verification": {
-    "mao_recalculated": 0,
-    "anchor_recalculated": 0,
-    "novation_mao_recalculated": 0,
-    "match": true
-  }
-}`;
-
-const OUTPUT_AGENT_SYSTEM = `You are the Output Agent for Next Day Home Buyers LLC. You receive results from three verified agents and assemble the final JSON for the frontend. Do NOT recalculate anything — use the numbers as given.
-
-OUTPUT: Return this exact JSON structure (no extra fields, no nulls):
-{
-  "verdict": "🟢|🟡|🔴",
-  "verdict_reason": "...",
-  "retail_arv": 0,
-  "total_discounts": 0,
-  "as_is_value": 0,
-  "list_price": 0,
-  "mao": 0,
-  "anchor_price": 0,
-  "novation_list_price": 0,
-  "novation_mao": 0,
-  "timeline": "...",
-  "subject_last_sold": { "price": 0, "date": "..." },
-  "comparable_sales": [
-    { "address": "...", "beds": 0, "baths": 0, "sqft": 0, "sale_price": 0, "ppsf": 0, "sale_date": "..." }
-  ],
-  "active_listings": [],
-  "red_flags": [],
-  "discounts_breakdown": [],
-  "negotiation_strategy": "...",
-  "notes": "..."
-}`;
-
-// ─────────────────────────────────────────────
-// MAIN ANALYZE ENDPOINT
-// ─────────────────────────────────────────────
-
-app.post('/analyze', async (req, res) => {
-  const { address, callNotes } = req.body;
-
-  if (!address || !callNotes) {
-    return res.status(400).json({ error: 'Missing address or callNotes' });
-  }
-
+// Post a single message to Slack (used for acks before long-running ops)
+async function postToSlack(channel, thread, text, env) {
   try {
-    // Parse address into address1 / address2
-    // Expected format: "123 Main St, City, ST 12345"
-    const commaIdx = address.indexOf(',');
-    const address1 = commaIdx > -1 ? address.substring(0, commaIdx).trim() : address;
-    const address2 = commaIdx > -1 ? address.substring(commaIdx + 1).trim() : '';
+    const msg = { channel, text };
+    if (thread) msg.thread_ts = thread;
+    await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + env.SLACK_BOT_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(msg)
+    });
+  } catch (e) {}
+}
 
-    console.log(`[ATTOM] Fetching property detail for: ${address1}, ${address2}`);
-
-    // ── STEP 1: Pull subject property from ATTOM ──────────────────────
-    let subject;
-    try {
-      subject = await attomPropertyDetail(address1, address2);
-      console.log(`[ATTOM] Subject: ${subject.sqft} sqft, ${subject.beds}bd/${subject.baths}ba, lat:${subject.lat} lon:${subject.lon}`);
-    } catch (attomErr) {
-      console.error('[ATTOM] Property detail failed:', attomErr.message);
-      return res.status(500).json({ error: `Could not locate property in ATTOM: ${attomErr.message}` });
+// Pull recent thread/DM messages so JARVIS stays in-context (memory) in Slack too.
+async function fetchHistory(channel, thread, env) {
+  try {
+    const url = thread
+      ? 'https://slack.com/api/conversations.replies?channel=' + channel + '&ts=' + thread + '&limit=12'
+      : 'https://slack.com/api/conversations.history?channel=' + channel + '&limit=12';
+    const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + env.SLACK_BOT_TOKEN } });
+    const j = await r.json();
+    if (!j || !j.ok || !Array.isArray(j.messages)) return [];
+    let msgs = j.messages.slice();
+    if (!thread) msgs.reverse();
+    const out = [];
+    for (const m of msgs) {
+      const t = (m.text || '').replace(/<@[^>]+>/g, '').trim();
+      if (!t) continue;
+      if (m.bot_id) out.push({ role: 'assistant', content: t });
+      else if (m.user === CHRIS) out.push({ role: 'user', content: t });
     }
+    while (out.length && out[out.length - 1].role === 'user') out.pop();
+    return out.slice(-8);
+  } catch (e) { return []; }
+}
 
-    // ── STEP 2: Pull comps with tiered expansion ──────────────────────
-    let comps = [], tierUsed = { radius: 3, sqftBuffer: 1500 };
-    if (!subject.sqft) {
-      console.warn('[ATTOM] sqft missing for subject — skipping comp pull, agents will flag');
-    } else {
-      try {
-        ({ comps, tierUsed } = await pullCompsWithTiers(subject.lat, subject.lon, subject.sqft));
-        console.log(`[ATTOM] ${comps.length} comps found at radius ${tierUsed.radius}mi / ±${tierUsed.sqftBuffer}sqft`);
-      } catch (compErr) {
-        console.error('[ATTOM] Comp pull failed:', compErr.message);
-        // Non-fatal — proceed with empty comps, agent will flag it
-      }
-    }
-
-    // ── AGENT 1: Comp Agent ───────────────────────────────────────────
-    console.log('[AGENT 1] Running Comp Agent...');
-    const compPrompt = `
-SUBJECT PROPERTY (from ATTOM county records):
-${JSON.stringify(subject, null, 2)}
-
-CANDIDATE COMPARABLE SALES (from ATTOM, pre-filtered to ${tierUsed?.radius || 3}mi radius / ±${tierUsed?.sqftBuffer || 1500}sqft / 15 months):
-${JSON.stringify(comps, null, 2)}
-
-ACQUISITION CALL NOTES:
-${callNotes}
-
-Evaluate these comps against the locked criteria. Identify qualifying comps, exclude outliers with reasons, and calculate avg $/sqft. Return your JSON.`;
-
-    const compResult = await runAgent(COMP_AGENT_SYSTEM, compPrompt);
-    if (!compResult.verified) {
-      console.warn('[AGENT 1] Comp Agent returned verified: false — continuing with flagged result');
-    }
-
-    // ── AGENT 2: Discount Agent ───────────────────────────────────────
-    console.log('[AGENT 2] Running Discount Agent...');
-    const discountPrompt = `
-SUBJECT PROPERTY:
-${JSON.stringify(subject, null, 2)}
-
-ACQUISITION CALL NOTES:
-${callNotes}
-
-Extract all conditions from the call notes and apply the locked discount table. Return your JSON.`;
-
-    const discountResult = await runAgent(DISCOUNT_AGENT_SYSTEM, discountPrompt);
-    if (!discountResult.verified) {
-      console.warn('[AGENT 2] Discount Agent returned verified: false — continuing with flagged result');
-    }
-
-    // ── AGENT 3: Formula Agent ────────────────────────────────────────
-    console.log('[AGENT 3] Running Formula Agent...');
-    const formulaPrompt = `
-COMP AGENT RESULTS:
-${JSON.stringify(compResult, null, 2)}
-
-DISCOUNT AGENT RESULTS:
-${JSON.stringify(discountResult, null, 2)}
-
-SUBJECT SQFT: ${subject.sqft}
-
-Run the locked 7-step formula for both wholesale and novation paths. Self-verify your math. Return your JSON.`;
-
-    const formulaResult = await runAgent(FORMULA_AGENT_SYSTEM, formulaPrompt);
-    if (formulaResult.self_verification && !formulaResult.self_verification.match) {
-      console.warn('[AGENT 3] Self-verification mismatch (rounding) — continuing with primary values');
-    }
-
-    // ── AGENT 4: Output Agent ─────────────────────────────────────────
-    console.log('[AGENT 4] Running Output Agent...');
-    const outputPrompt = `
-COMP RESULTS:
-${JSON.stringify(compResult, null, 2)}
-
-DISCOUNT RESULTS:
-${JSON.stringify(discountResult, null, 2)}
-
-FORMULA RESULTS:
-${JSON.stringify(formulaResult, null, 2)}
-
-Assemble the final frontend JSON. Return ONLY the JSON object.`;
-
-    const finalResult = await runAgent(OUTPUT_AGENT_SYSTEM, outputPrompt);
-
-    console.log(`[DONE] Verdict: ${finalResult.verdict} | MAO: $${finalResult.mao} | Novation MAO: $${finalResult.novation_mao}`);
-    return res.json({ response: JSON.stringify(finalResult) });
-
-  } catch (err) {
-    console.error('[ERROR]', err.message);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────
-// HEALTH CHECK
-// ─────────────────────────────────────────────
-
-app.get('/health', (req, res) => res.json({ status: 'ok', attom: !!ATTOM_KEY, anthropic: !!ANTHROPIC_KEY }));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+async function verifySlackSignature(request, body, signingSecret) {
+  const ts = request.headers.get('x-slack-request-timestamp');
+  const sig = request.headers.get('x-slack-signature');
+  if (!ts || !sig || !signingSecret) return false;
+  const tsNum = Number(ts);
+  if (!Number.isFinite(tsNum)) return false;
+  if (Math.abs(Date.now() / 1000 - tsNum) > 300) return false;
+  const baseString = `v0:${ts}:${body}`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(signingSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sigBytes = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(baseString));
+  const expected = 'v0=' + Array.from(new Uint8Array(sigBytes)).map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expected.length !== sig.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+  return diff === 0;
+}
