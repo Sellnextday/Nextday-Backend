@@ -62,18 +62,15 @@ async function attomPropertyDetail(address1, address2) {
 const fmtDate = d => (d instanceof Date ? d : new Date(d)).toISOString().split('T')[0];
 
 async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
-  // Do NOT pass date params to ATTOM — sale/snapshot ignores them inconsistently.
-  // Pull all results and filter client-side (15-month cutoff applied below).
+  // Pull ALL sales in radius from ATTOM — no sqft or date params sent to API
+  // (ATTOM sale/snapshot ignores or errors on extra filters inconsistently).
+  // All filtering is done client-side below.
   const params = {
     latitude:  lat,
     longitude: lon,
     radius:    radiusMiles,
     pagesize:  50
   };
-  if (sqft) {
-    params.minsqsize = Math.max(1, sqft - sqftBuffer);
-    params.maxsqsize = sqft + sqftBuffer;
-  }
 
   let res;
   try {
@@ -86,7 +83,7 @@ async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
     return [];
   }
 
-  // 15-month cutoff — filter client-side
+  // Client-side filters: 15-month cutoff + sqft range + must have sale price
   const cutoff = new Date();
   cutoff.setMonth(cutoff.getMonth() - 15);
 
@@ -96,6 +93,12 @@ async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
       const saleDate = p.sale?.saleTransDate || p.sale?.salesearchdate;
       if (!saleDate) return false;
       if (new Date(saleDate) < cutoff) return false;
+      // Sqft filter — only apply if subject sqft is known and comp has sqft
+      if (sqft && sqftBuffer) {
+        const compSqft = parseInt(p.building?.size?.universalsize || p.building?.size?.livingsize || 0);
+        if (compSqft > 0 && (compSqft < sqft - sqftBuffer || compSqft > sqft + sqftBuffer)) return false;
+        // If comp has no sqft recorded, keep it — agent will note it
+      }
       return true;
     })
     .map(p => {
