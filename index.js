@@ -111,7 +111,10 @@ async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
       const cLat = parseFloat(p.location?.latitude);
       const cLon = parseFloat(p.location?.longitude);
       return {
-        address:       p.address?.oneLine || p.address?.line1,
+        address:       p.address?.oneLine
+                    || [p.address?.line1, p.address?.line2].filter(Boolean).join(', ')
+                    || p.address?.full
+                    || null,
         sqft:          sqftComp,
         beds:          parseInt(p.building?.rooms?.beds)       || null,
         baths:         parseInt(p.building?.rooms?.bathstotal) || null,
@@ -515,32 +518,27 @@ Call notes: ${callNotes}`;
 
 const NARRATIVE_SYSTEM = `You are JARVIS, a sharp real estate investment analyst briefing an experienced investor.
 Be direct. No fluff. No "Based on my analysis" preamble.
-Comment on: what the comps are saying, market velocity (DOM), flipper activity if present, which exit looks better and why.
-Never invent numbers — only reference what's provided.
-
-Return ONLY valid JSON:
-{
-  "jarvisRead": "<2-3 tight sentences>",
-  "exitRecommendation": "wholesale|novation|either|neither",
-  "exitReason": "<one sentence>",
-  "needsInfo": ["<what would sharpen this analysis>"]
-}`;
+Write exactly 4 lines, each on its own line, with no labels or prefixes:
+Line 1: 2-sentence market read (what the comps say, DOM velocity, any flip activity)
+Line 2: Which exit is stronger and why (wholesale vs novation), one sentence
+Line 3: Biggest risk or flag on this deal, one sentence. If none, write "No major flags."
+Line 4: What info would most sharpen this analysis, one sentence. If you have everything, write "Data looks complete."
+Never invent numbers. Reference only what is provided.`;
 
 async function narrativeAgent(subject, compData, repairData, formulaData, callNotes) {
   const compLines = (compData.comps || []).slice(0, 6).map((c, i) =>
-    `${i+1}. ${c.sqft || '?'}sf ${c.beds || '?'}bd/${c.baths || '?'}ba ` +
-    `${c.yearBuilt || '?'} ${c.distanceMi !== null ? c.distanceMi + 'mi' : ''} ` +
+    `${i+1}. ${c.address || 'unknown'} | ${c.sqft || '?'}sf ${c.beds || '?'}bd/${c.baths || '?'}ba ` +
+    `built ${c.yearBuilt || '?'} ${c.distanceMi !== null ? c.distanceMi + 'mi' : ''} ` +
     `$${c.saleAmt?.toLocaleString()} ${c.saleDate} DOM:${c.dom || '?'} adj$${c.adjPpsf || '?'}/sf` +
-    (c.isFlip ? ' FLIP' : '') + (c.isOutlier ? ` OUTLIER(${c.outlierNote})` : '')
+    (c.isFlip ? ' [FLIP]' : '') + (c.isOutlier ? ` [OUTLIER: ${c.outlierNote}]` : '')
   ).join('\n');
 
-  const user =
-`Property: ${subject.address} | ${subject.sqft}sqft | ${subject.beds}bd/${subject.baths}ba | Built ${subject.yearBuilt} | ${subject.propertyType}
+  const compsWithSqft = (compData.comps || []).filter(c => c.adjPpsf).length;
 
-Market: ${compData.comps.length} comps · ${compData.maxRadius}mi · avg $${compData.avgPpsf}/sqft` +
-` · range $${compData.ppsfRange?.min || '?'}–$${compData.ppsfRange?.max || '?'}/sqft` +
-(compData.avgDom ? ` · avg DOM ${compData.avgDom}` : '') +
-(compData.flips > 0 ? ` · ${compData.flips} flip-confirmed sales` : '') + `
+  const user =
+`Property: ${subject.address} | ${subject.sqft}sqft | ${subject.beds || '?'}bd/${subject.baths || '?'}ba | Built ${subject.yearBuilt || '?'} | ${subject.propertyType}
+
+Market: ${compData.comps.length} comps found (${compsWithSqft} have sqft data) · ${compData.maxRadius}mi radius · avg $${compData.avgPpsf || '?'}/sqft · range $${compData.ppsfRange?.min || '?'}–$${compData.ppsfRange?.max || '?'}/sqft${compData.avgDom ? ' · avg DOM ' + compData.avgDom : ''}${compData.flips > 0 ? ' · ' + compData.flips + ' flip-confirmed' : ''}
 
 Comps:
 ${compLines || 'None'}
@@ -552,14 +550,37 @@ Wholesale MAO $${formulaData.wholesaleMao?.toLocaleString() || 'N/A'} · Anchor 
 Novation MAO $${formulaData.novationMao?.toLocaleString() || 'N/A'} · List at $${formulaData.novationListPrice?.toLocaleString() || 'N/A'}
 Certainty: ${compData.certainty?.score || 0}% (${compData.certainty?.label || '?'})
 
-Call notes: ${callNotes || 'none'}`;
+Call notes: ${callNotes || 'none provided'}`;
 
   try {
-    const r = await callClaude(NARRATIVE_SYSTEM, user, 500);
-    return r || { jarvisRead: 'See numbers above.', exitRecommendation: 'either', exitReason: null, needsInfo: [] };
+    const res = await axios({
+      method: 'post',
+      url:    'https://api.anthropic.com/v1/messages',
+      timeout: 60000,
+      headers: {
+        'x-api-key':         ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type':      'application/json'
+      },
+      data: {
+        model:      MODEL,
+        max_tokens: 400,
+        system:     NARRATIVE_SYSTEM,
+        messages:   [{ role: 'user', content: user }]
+      }
+    });
+    const text = (res.data.content?.find(b => b.type === 'text')?.text || '').trim();
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    return {
+      jarvisRead:         lines[0] || 'Analysis complete.',
+      exitReason:         lines[1] || null,
+      biggestRisk:        lines[2] || null,
+      needsInfo:          lines[3] ? [lines[3]] : [],
+      exitRecommendation: 'either'
+    };
   } catch (err) {
     console.warn('[narrativeAgent]', err.message);
-    return { jarvisRead: 'Analysis complete.', exitRecommendation: 'either', exitReason: null, needsInfo: [] };
+    return { jarvisRead: 'Analysis complete — see numbers above.', exitReason: null, biggestRisk: null, needsInfo: [], exitRecommendation: 'either' };
   }
 }
 
@@ -636,21 +657,24 @@ function formatSlackOutput(subject, compData, repairData, formulaData, narrative
   }
 
   // JARVIS read
-  if (narrative.jarvisRead) {
-    L.push(`💡 *JARVIS:* ${narrative.jarvisRead}`);
-  }
+  if (narrative.jarvisRead) L.push(`💡 *JARVIS:* ${narrative.jarvisRead}`);
+  if (narrative.exitReason)  L.push(`🎯 ${narrative.exitReason}`);
+  if (narrative.biggestRisk && narrative.biggestRisk !== 'No major flags.')
+    L.push(`⚠️ ${narrative.biggestRisk}`);
 
   // Flags
+  const compsWithSqft = (compData.comps || []).filter(c => c.adjPpsf).length;
   const allFlags = [
     ...(repairData.redFlags || []),
     ...(compData.notes || []),
-    ...(compData.maxRadius > 5 ? [`Comps spread to ${compData.maxRadius}mi — thin market data`] : [])
+    ...(compData.maxRadius > 5 ? [`Comps spread to ${compData.maxRadius}mi — thin market`] : []),
+    ...(compsWithSqft < 3 ? [`Only ${compsWithSqft} comp${compsWithSqft !== 1 ? 's' : ''} had sqft data — ARV less reliable`] : [])
   ];
   if (allFlags.length > 0) L.push(`🚩 ${allFlags.join(' · ')}`);
 
   // What would sharpen it
-  if (narrative.needsInfo && narrative.needsInfo.length > 0) {
-    L.push(`📎 Would sharpen this: ${narrative.needsInfo.join(', ')}`);
+  if (narrative.needsInfo && narrative.needsInfo.length > 0 && narrative.needsInfo[0] !== 'Data looks complete.') {
+    L.push(`📎 ${narrative.needsInfo[0]}`);
   }
 
   return L.join('\n');
