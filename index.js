@@ -16,19 +16,30 @@ const MAX_ITERATIONS = 15;
 // ─────────────────────────────────────────────
 
 async function attomPropertyDetail(address1, address2) {
-  const res = await axios.get(
-    'https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/detail',
-    {
-      headers: { apikey: ATTOM_KEY, Accept: 'application/json' },
-      params: { address1, address2 },
-      timeout: 15000
-    }
-  );
+  let res;
+  try {
+    res = await axios.get(
+      'https://api.gateway.attomdata.com/propertyapi/v1.0.0/property/detail',
+      {
+        headers: { apikey: ATTOM_KEY, Accept: 'application/json' },
+        params: { address1, address2 },
+        timeout: 15000
+      }
+    );
+  } catch (axiosErr) {
+    const status  = axiosErr.response?.status;
+    const detail  = axiosErr.response?.data?.status?.msg || axiosErr.response?.data?.message || axiosErr.message;
+    throw new Error(`ATTOM HTTP ${status || 'error'}: ${detail}`);
+  }
   const prop = res.data.property?.[0];
-  if (!prop) throw new Error('ATTOM: property not found');
+  if (!prop) {
+    const msg = res.data?.status?.msg || 'no property record returned';
+    throw new Error(`ATTOM: property not found — ${msg}`);
+  }
+  const sqft = prop.building?.size?.universalsize || prop.building?.size?.livingsize || null;
   return {
     address:       prop.address?.oneLine,
-    sqft:          prop.building?.size?.universalsize,
+    sqft:          sqft ? parseInt(sqft) : null,
     beds:          prop.building?.rooms?.beds,
     baths:         prop.building?.rooms?.bathstotal,
     lotSize:       prop.lot?.lotsize1,
@@ -364,13 +375,17 @@ app.post('/analyze', async (req, res) => {
     }
 
     // ── STEP 2: Pull comps with tiered expansion ──────────────────────
-    let comps = [], tierUsed = null;
-    try {
-      ({ comps, tierUsed } = await pullCompsWithTiers(subject.lat, subject.lon, subject.sqft));
-      console.log(`[ATTOM] ${comps.length} comps found at radius ${tierUsed.radius}mi / ±${tierUsed.sqftBuffer}sqft`);
-    } catch (compErr) {
-      console.error('[ATTOM] Comp pull failed:', compErr.message);
-      // Non-fatal — proceed with empty comps, agent will flag it
+    let comps = [], tierUsed = { radius: 3, sqftBuffer: 1500 };
+    if (!subject.sqft) {
+      console.warn('[ATTOM] sqft missing for subject — skipping comp pull, agents will flag');
+    } else {
+      try {
+        ({ comps, tierUsed } = await pullCompsWithTiers(subject.lat, subject.lon, subject.sqft));
+        console.log(`[ATTOM] ${comps.length} comps found at radius ${tierUsed.radius}mi / ±${tierUsed.sqftBuffer}sqft`);
+      } catch (compErr) {
+        console.error('[ATTOM] Comp pull failed:', compErr.message);
+        // Non-fatal — proceed with empty comps, agent will flag it
+      }
     }
 
     // ── AGENT 1: Comp Agent ───────────────────────────────────────────
