@@ -122,14 +122,46 @@ async function pullCompsWithTiers(lat, lon, sqft) {
 // JSON EXTRACTOR
 // ─────────────────────────────────────────────
 
+function sanitizeControlChars(str) {
+  // Walk the JSON character by character. Inside a string value,
+  // escape any raw control characters (newline, tab, CR, etc.) that
+  // would make JSON.parse throw "Bad control character".
+  let result = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    const code = str.charCodeAt(i);
+    if (escaped) {
+      result += c;
+      escaped = false;
+    } else if (c === '\\' && inString) {
+      result += c;
+      escaped = true;
+    } else if (c === '"') {
+      result += c;
+      inString = !inString;
+    } else if (inString && code < 0x20) {
+      // Raw control character inside a JSON string — escape it
+      if (c === '\n') result += '\\n';
+      else if (c === '\r') result += '\\r';
+      else if (c === '\t') result += '\\t';
+      else result += '\\u' + code.toString(16).padStart(4, '0');
+    } else {
+      result += c;
+    }
+  }
+  return result;
+}
+
 function extractJSON(text) {
   text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '');
   const first = text.indexOf('{');
   const last  = text.lastIndexOf('}');
   if (first !== -1 && last !== -1 && last > first) {
-    return text.substring(first, last + 1);
+    return sanitizeControlChars(text.substring(first, last + 1));
   }
-  return text.trim();
+  return sanitizeControlChars(text.trim());
 }
 
 // ─────────────────────────────────────────────
