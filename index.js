@@ -122,28 +122,50 @@ async function pullCompsWithTiers(lat, lon, sqft) {
 // JSON EXTRACTOR
 // ─────────────────────────────────────────────
 
-function sanitizeControlChars(str) {
-  // Walk the JSON character by character. Inside a string value,
-  // escape any raw control characters (newline, tab, CR, etc.) that
-  // would make JSON.parse throw "Bad control character".
+function extractJSON(raw) {
+  // ── Step 1: strip markdown code fences ──────────────────────────
+  let text = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+
+  // ── Step 2: isolate the JSON object ─────────────────────────────
+  const first = text.indexOf('{');
+  const last  = text.lastIndexOf('}');
+  if (first !== -1 && last !== -1 && last > first) {
+    text = text.substring(first, last + 1);
+  } else {
+    text = text.trim();
+  }
+
+  // ── Step 3: remove JS-style single-line comments (// ...)
+  //            but NOT inside strings and NOT URLs (://)
+  text = text.replace(/^[ \t]*\/\/[^\n]*/gm, '');   // line-start only
+  text = text.replace(/([,{[\s])\/\/[^\n]*/g, '$1'); // after comma/brace
+
+  // ── Step 4: remove block comments /* ... */ ──────────────────────
+  text = text.replace(/\/\*[\s\S]*?\*\//g, '');
+
+  // ── Step 5: fix trailing commas before ] or } ────────────────────
+  text = text.replace(/,(\s*[}\]])/g, '$1');
+
+  // ── Step 6: fix unquoted keys  { key: → { "key": ────────────────
+  //            Only on word-char keys not already quoted
+  text = text.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*):/g, '$1"$2"$3:');
+
+  // ── Step 7: fix single-quoted strings → double-quoted ───────────
+  //            Simple heuristic — only when the value is clearly a string
+  text = text.replace(/'([^'\\]*(\\.[^'\\]*)*)'/g, '"$1"');
+
+  // ── Step 8: escape raw control characters inside string values ───
   let result = '';
-  let inString = false;
-  let escaped = false;
-  for (let i = 0; i < str.length; i++) {
-    const c = str[i];
-    const code = str.charCodeAt(i);
-    if (escaped) {
-      result += c;
-      escaped = false;
-    } else if (c === '\\' && inString) {
-      result += c;
-      escaped = true;
-    } else if (c === '"') {
-      result += c;
-      inString = !inString;
-    } else if (inString && code < 0x20) {
-      // Raw control character inside a JSON string — escape it
-      if (c === '\n') result += '\\n';
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const code = text.charCodeAt(i);
+    if (esc)           { result += c; esc = false; continue; }
+    if (c === '\\' && inStr) { result += c; esc = true; continue; }
+    if (c === '"')     { result += c; inStr = !inStr; continue; }
+    if (inStr && code < 0x20) {
+      if (c === '\n')      result += '\\n';
       else if (c === '\r') result += '\\r';
       else if (c === '\t') result += '\\t';
       else result += '\\u' + code.toString(16).padStart(4, '0');
@@ -152,16 +174,6 @@ function sanitizeControlChars(str) {
     }
   }
   return result;
-}
-
-function extractJSON(text) {
-  text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '');
-  const first = text.indexOf('{');
-  const last  = text.lastIndexOf('}');
-  if (first !== -1 && last !== -1 && last > first) {
-    return sanitizeControlChars(text.substring(first, last + 1));
-  }
-  return sanitizeControlChars(text.trim());
 }
 
 // ─────────────────────────────────────────────
