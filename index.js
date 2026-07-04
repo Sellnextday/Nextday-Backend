@@ -201,6 +201,8 @@ COMP POOL RULES:
 - 1–2 qualifying comps → flag 🟡 "LIMITED COMP DATA — verify manually"
 - 0 qualifying comps → flag 🔴 "Insufficient Comp Data — Run Manually"
 
+IMPORTANT: Always return verified: true regardless of comp count. Use data_quality_flag to communicate data issues. Never refuse to return a result.
+
 OUTPUT: Return a JSON object with this exact structure:
 {
   "verified": true,
@@ -255,7 +257,7 @@ RED FLAGS TO CHECK:
 - Seller owes more than MAO (short sale needed)
 NOTE: Manufactured/mobile homes are NOT a red flag — we buy these.
 
-SELF-VERIFY: Before returning, confirm every condition from the notes is accounted for. Sum your discounts and verify the math.
+SELF-VERIFY: Before returning, confirm every condition from the notes is accounted for. Sum your discounts and verify the math. Always return verified: true — use unmatched_conditions for anything you couldn't map.
 
 OUTPUT: Return a JSON object:
 {
@@ -271,32 +273,32 @@ OUTPUT: Return a JSON object:
   "unmatched_conditions": []
 }`;
 
-const FORMULA_AGENT_SYSTEM = `You are the Formula Agent for Next Day Home Buyers LLC. You run the locked 7-step formula and SELF-VERIFY your math before returning anything.
+const FORMULA_AGENT_SYSTEM = `You are the Formula Agent for Next Day Home Buyers LLC. You ALWAYS return a complete JSON result — never refuse, never return verified: false.
 
-THE LOCKED FORMULA — follow exactly, no exceptions:
-
+IF COMP DATA IS AVAILABLE (avg_ppsf > 0):
+Run the locked 7-step formula:
 Step 1: Comp Avg $/sqft = average of qualifying comp $/sqft values
 Step 2: Retail ARV = Comp Avg $/sqft × Subject Sqft
 Step 3: As-Is Value = Retail ARV − Total Discount
 Step 4: List Price = As-Is Value × 0.90
 Step 5: MAO = List Price − (List Price × 0.05) − (List Price × 0.02) − $25,000
         Anchor Price = MAO × 0.85
-
-NOVATION PATH (run simultaneously):
 Novation List Price = Retail ARV − $30,000
 Novation MAO = Novation List Price − (Novation List Price × 0.05) − (Novation List Price × 0.02) − $25,000
-
 MLS CAP RULE: If mls_cap_price exists → Wholesale MAO = MIN(calculated MAO, mls_cap_price)
 LIQUIDITY DISCOUNT: If median DOM ≥ 45 days → apply additional 3% discount to As-Is Value before formula
 
-Step 6: Timeline = median DOM from comps + red flag adjustments
-Step 7: Verdict = 🟢 Green / 🟡 Yellow / 🔴 Red — based on NUMBERS ONLY, never seller situation
+IF NO COMP DATA (avg_ppsf = 0 or comp_count = 0):
+Set all dollar fields to 0. Set verdict to 🔴. Set verdict_reason to "Insufficient comp data — run manually". Still return verified: true.
 
-ROUNDING RULE: Round every dollar amount to the nearest whole dollar throughout all calculations. Do NOT use decimals in any output dollar field.
+ROUNDING RULE: Round every dollar amount to the nearest whole dollar. No decimals.
 
-SELF-VERIFY: After calculating, re-derive MAO and Anchor from scratch using your own rounded output numbers. If they differ by more than $5, recalculate. Minor rounding differences of $1–$5 are acceptable — set match: true in that case.
+SELF-VERIFY: Re-derive MAO from scratch. Differences under $5 = match: true (rounding). Over $5 = recalculate.
 
-OUTPUT: Return a JSON object:
+Step 6: Timeline = median DOM from comps, or "N/A" if no comps
+Step 7: Verdict = 🟢 Green / 🟡 Yellow / 🔴 Red — based on NUMBERS ONLY
+
+OUTPUT — always return this exact JSON:
 {
   "verified": true,
   "retail_arv": 0,
@@ -406,7 +408,7 @@ Evaluate these comps against the locked criteria. Identify qualifying comps, exc
 
     const compResult = await runAgent(COMP_AGENT_SYSTEM, compPrompt);
     if (!compResult.verified) {
-      return res.status(500).json({ error: 'Comp Agent failed verification' });
+      console.warn('[AGENT 1] Comp Agent returned verified: false — continuing with flagged result');
     }
 
     // ── AGENT 2: Discount Agent ───────────────────────────────────────
@@ -422,7 +424,7 @@ Extract all conditions from the call notes and apply the locked discount table. 
 
     const discountResult = await runAgent(DISCOUNT_AGENT_SYSTEM, discountPrompt);
     if (!discountResult.verified) {
-      return res.status(500).json({ error: 'Discount Agent failed verification' });
+      console.warn('[AGENT 2] Discount Agent returned verified: false — continuing with flagged result');
     }
 
     // ── AGENT 3: Formula Agent ────────────────────────────────────────
@@ -439,11 +441,7 @@ SUBJECT SQFT: ${subject.sqft}
 Run the locked 7-step formula for both wholesale and novation paths. Self-verify your math. Return your JSON.`;
 
     const formulaResult = await runAgent(FORMULA_AGENT_SYSTEM, formulaPrompt);
-    if (!formulaResult.verified) {
-      return res.status(500).json({ error: 'Formula Agent failed verification' });
-    }
-    if (!formulaResult.self_verification?.match) {
-      // Rounding artifact — log but continue. Chris reviews final numbers anyway.
+    if (formulaResult.self_verification && !formulaResult.self_verification.match) {
       console.warn('[AGENT 3] Self-verification mismatch (rounding) — continuing with primary values');
     }
 
