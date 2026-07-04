@@ -62,16 +62,13 @@ async function attomPropertyDetail(address1, address2) {
 const fmtDate = d => (d instanceof Date ? d : new Date(d)).toISOString().split('T')[0];
 
 async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
-  const end   = new Date();
-  const start = new Date(); start.setMonth(start.getMonth() - 15);
-
+  // Do NOT pass date params to ATTOM — sale/snapshot ignores them inconsistently.
+  // Pull all results and filter client-side (15-month cutoff applied below).
   const params = {
-    latitude:            lat,
-    longitude:           lon,
-    radius:              radiusMiles,
-    startsalesearchdate: fmtDate(start),
-    endsalesearchdate:   fmtDate(end),
-    pagesize:            50
+    latitude:  lat,
+    longitude: lon,
+    radius:    radiusMiles,
+    pagesize:  50
   };
   if (sqft) {
     params.minsqsize = Math.max(1, sqft - sqftBuffer);
@@ -89,8 +86,18 @@ async function attomSaleComps(lat, lon, radiusMiles, sqft, sqftBuffer) {
     return [];
   }
 
+  // 15-month cutoff — filter client-side
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - 15);
+
   return (res.data?.property || [])
-    .filter(p => p.sale?.amount?.saleamt && parseFloat(p.sale.amount.saleamt) > 0)
+    .filter(p => {
+      if (!p.sale?.amount?.saleamt || parseFloat(p.sale.amount.saleamt) <= 0) return false;
+      const saleDate = p.sale?.saleTransDate || p.sale?.salesearchdate;
+      if (!saleDate) return false;
+      if (new Date(saleDate) < cutoff) return false;
+      return true;
+    })
     .map(p => {
       const sqftComp  = parseInt(p.building?.size?.universalsize || p.building?.size?.livingsize || 0) || null;
       const saleAmt   = parseFloat(p.sale.amount.saleamt);
@@ -694,7 +701,7 @@ app.post('/analyze', async (req, res) => {
     if (rawComps.length === 0) {
       return res.json({
         needs_info: true,
-        message: `No county-recorded comps found within 10mi for *${subject.address}* (${subject.propertyType} · ${subject.sqft.toLocaleString()}sqft). This can happen in TX non-disclosure, very rural markets, or with manufactured homes on leased land. Want me to try without the sqft filter, or can you point me to any comps you're aware of?`
+        message: `No county-recorded comps found within 10mi for *${subject.address}* (${subject.propertyType} · ${subject.sqft.toLocaleString()}sqft). ATTOM may have limited sales data for this area or the sqft filter is too tight. Want me to try without the sqft filter? Or drop any comps you know of and I'll work from those.`
       });
     }
 
