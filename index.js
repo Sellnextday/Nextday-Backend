@@ -13,6 +13,11 @@ const MODEL         = 'claude-sonnet-4-6';
 const ZILLOW_HOST   = 'zillow-real-estate-data-api.p.rapidapi.com';
 
 // ══════════════════════════════════════════════════════
+// DEAL MEMORY — stores last analysis for JARVIS follow-up
+// ══════════════════════════════════════════════════════
+let lastDeal = null;
+
+// ══════════════════════════════════════════════════════
 // SUBJECT PROPERTY — parsed from your call notes
 // ══════════════════════════════════════════════════════
 
@@ -701,17 +706,17 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   if (compData.usable.length) {
     L.push(`📋 *COMPS — FULL DATA* (${compData.usable.length})`);
     compData.usable.slice(0,8).forEach((c,i) => {
-      const enrichTag   = c.zillowEnriched ? ' ✦' : '';
+      const sourceTag   = c.zillowEnriched ? ' _[County+Zillow]_' : ' _[County]_';
       const flipTag     = c.flipComp ? ' ⚡FLIP' : '';
       const outTag      = c.isOutlier ? ` ⚠️(${c.outlierNote?.split(',')[0]})` : '';
       const vintageYrs  = (subject.yearBuilt && c.yearBuilt) ? subject.yearBuilt - c.yearBuilt : 0;
       const vintageTag  = vintageYrs >= 25 ? ` 📅-${vintageYrs}yr` : '';
       L.push(
         `${i+1}. ${c.address||'—'} | ${c.sqft}sf ${c.beds||'?'}bd/${c.baths||'?'}ba ${c.yearBuilt||'?'} ` +
-        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${enrichTag}${flipTag}${outTag}${vintageTag}`
+        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${sourceTag}${flipTag}${outTag}${vintageTag}`
       );
     });
-    if (compData.usable.some(c=>c.zillowEnriched)) L.push('_✦ bed/bath enriched from Zillow_');
+    L.push('_Source: County = ATTOM county records  ·  County+Zillow = county records + Zillow bed/bath enrichment_');
     if (compData.vintageGap >= 25) L.push('_📅 = years older than subject — adjustment applied but value is approximate_');
     L.push('');
   }
@@ -724,10 +729,10 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push(`🏗️ *NEW CONSTRUCTION REFERENCE COMPS* (${nc.length} same-era sales · up to 10mi)`);
     if (ncAvg) L.push(`Avg $${ncAvg}/sqft adj — _use this alongside vintage comps for new-build pricing_`);
     nc.slice(0,5).forEach((c,i) => {
-      const enrichTag = c.zillowEnriched ? ' ✦' : '';
+      const sourceTag = c.zillowEnriched ? ' _[County+Zillow]_' : ' _[County]_';
       L.push(
         `${i+1}. ${c.address||'—'} | ${c.sqft}sf ${c.beds||'?'}bd/${c.baths||'?'}ba built ${c.yearBuilt} ` +
-        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · $${c.adjPpsf}/sf adj${enrichTag}`
+        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · $${c.adjPpsf}/sf adj${sourceTag}`
       );
     });
     L.push('');
@@ -846,6 +851,56 @@ app.post('/analyze', async (req, res) => {
 
     // 10. Format and return
     const slackMessage = formatSlack(subject, compData, formulaData, narrative, pulse);
+
+    // 11. Store deal in memory so JARVIS can answer follow-up questions
+    lastDeal = {
+      address:        subject.address,
+      analyzedAt:     new Date().toISOString(),
+      subject: {
+        sqft:         subject.sqft,
+        beds:         subject.beds,
+        baths:        subject.baths,
+        yearBuilt:    subject.yearBuilt,
+        propertyType: subject.propertyType
+      },
+      asIsValue:      formulaData.asIsValue,
+      novationMao:    formulaData.novationMao,
+      listPrice:      formulaData.novationListPrice,
+      avgPpsf:        compData.avgPpsf,
+      ppsfRange:      compData.ppsfRange,
+      certainty:      compData.certainty,
+      compCount:      compData.usable.length,
+      maxRadius:      compData.maxRadius,
+      avgDom:         compData.avgDom,
+      vintageGap:     compData.vintageGap,
+      avgCompVintage: compData.avgCompVintage,
+      flips:          compData.flips,
+      outliers:       compData.outliers,
+      notes:          compData.notes,
+      comps: compData.usable.slice(0, 10).map(c => ({
+        address:    c.address,
+        sqft:       c.sqft,
+        beds:       c.beds,
+        baths:      c.baths,
+        yearBuilt:  c.yearBuilt,
+        saleAmt:    c.saleAmt,
+        saleDate:   c.saleDate,
+        adjPpsf:    c.adjPpsf,
+        distanceMi: c.distanceMi,
+        flipComp:   c.flipComp,
+        isOutlier:  c.isOutlier,
+        source:     c.zillowEnriched ? 'County+Zillow' : 'County'
+      })),
+      pulse: pulse ? {
+        count:       pulse.count,
+        avgListPpsf: pulse.avgListPpsf,
+        avgDom:      pulse.avgDom,
+        flipListings: pulse.flipListings,
+        topByPpsf:   pulse.topByPpsf
+      } : null,
+      narrative
+    };
+
     return res.json({ response: slackMessage });
 
   } catch (err) {
@@ -854,9 +909,19 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
+// Last deal — JARVIS calls this for follow-up questions about a deal
+app.get('/last-deal', (req, res) => {
+  if (!lastDeal) return res.json({ error: 'No deal analyzed yet this session' });
+  res.json(lastDeal);
+});
+
 app.get('/health', (req, res) =>
-  res.json({ status: 'ok', version: '3.1', attom: !!ATTOM_KEY, zillow: !!RAPIDAPI_KEY, anthropic: !!ANTHROPIC_KEY })
+  res.json({
+    status: 'ok', version: '3.2',
+    attom: !!ATTOM_KEY, zillow: !!RAPIDAPI_KEY, anthropic: !!ANTHROPIC_KEY,
+    lastDeal: lastDeal ? { address: lastDeal.address, analyzedAt: lastDeal.analyzedAt } : null
+  })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Deal Analyzer v3.1 (ATTOM + Zillow enrichment) on :${PORT}`));
+app.listen(PORT, () => console.log(`Deal Analyzer v3.2 (ATTOM + Zillow + deal memory) on :${PORT}`));
