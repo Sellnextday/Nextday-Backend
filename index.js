@@ -297,29 +297,41 @@ function normalizeStreet(addr) {
     .replace(/[.,#]/g,'').replace(/\s+/g,' ').trim();
 }
 
+const ENRICH_DIST_MI = 0.03; // ~50 meters — same property threshold
+
 function enrichCompsWithZillow(attomComps, zillowData) {
   return attomComps.map(comp => {
-    if (!comp.address) return comp;
-    const normA    = normalizeStreet(comp.address);
-    const numMatch = normA.match(/^(\d+)/);
-    if (!numMatch) return comp;
-    const houseNum = numMatch[1];
+    // PRIMARY: lat/lon proximity match (most reliable — bypasses address formatting differences)
+    let match = null;
+    if (comp.lat && comp.lon) {
+      match = zillowData.find(z =>
+        z.lat && z.lon && haversine(comp.lat, comp.lon, z.lat, z.lon) <= ENRICH_DIST_MI
+      );
+    }
 
-    const match = zillowData.find(z => {
-      const normZ = normalizeStreet(z.address);
-      if (!normZ.startsWith(houseNum + ' ')) return false;
-      const wordsA = normA.split(' ').slice(1, 4).join(' ');
-      const wordsZ = normZ.split(' ').slice(1, 4).join(' ');
-      return wordsA && wordsZ && (wordsZ.startsWith(wordsA.slice(0, 6)) || wordsA.startsWith(wordsZ.slice(0, 6)));
-    });
+    // FALLBACK: address string match if no lat/lon match found
+    if (!match && comp.address) {
+      const normA    = normalizeStreet(comp.address);
+      const numMatch = normA.match(/^(\d+)/);
+      if (numMatch) {
+        const houseNum = numMatch[1];
+        match = zillowData.find(z => {
+          const normZ = normalizeStreet(z.address);
+          if (!normZ.startsWith(houseNum + ' ')) return false;
+          const wordsA = normA.split(' ').slice(1, 4).join(' ');
+          const wordsZ = normZ.split(' ').slice(1, 4).join(' ');
+          return wordsA && wordsZ && (wordsZ.startsWith(wordsA.slice(0,6)) || wordsA.startsWith(wordsZ.slice(0,6)));
+        });
+      }
+    }
 
     if (!match) return comp;
     const wasEnriched = (!comp.beds && match.beds) || (!comp.baths && match.baths) || (!comp.sqft && match.sqft);
     return {
       ...comp,
-      beds:          comp.beds  || match.beds,
-      baths:         comp.baths || match.baths,
-      sqft:          comp.sqft  || match.sqft,
+      beds:           comp.beds  || match.beds,
+      baths:          comp.baths || match.baths,
+      sqft:           comp.sqft  || match.sqft,
       zillowEnriched: !!wasEnriched
     };
   });
@@ -331,18 +343,26 @@ function enrichCompsWithZillow(attomComps, zillowData) {
 
 function buildMarketPulse(listings, avgSoldPpsf) {
   if (!listings.length) return null;
-  const withPpsf = listings.filter(l => l.ppsf);
+  const withPpsf    = listings.filter(l => l.ppsf);
   const avgListPpsf = withPpsf.length ? Math.round(withPpsf.reduce((s,l)=>s+l.ppsf,0)/withPpsf.length) : null;
-  const withDom  = listings.filter(l => l.dom !== null && l.dom !== undefined);
-  const avgDom   = withDom.length ? Math.round(withDom.reduce((s,l)=>s+l.dom,0)/withDom.length) : null;
+  const withDom     = listings.filter(l => l.dom !== null && l.dom !== undefined);
+  const avgDom      = withDom.length ? Math.round(withDom.reduce((s,l)=>s+l.dom,0)/withDom.length) : null;
   const flipListings = avgSoldPpsf ? listings.filter(l => l.ppsf && l.ppsf >= avgSoldPpsf * 1.15) : [];
+
+  // Top active listings by $/sqft — likely new construction / fully renovated ceiling
+  const topByPpsf = [...withPpsf]
+    .sort((a, b) => b.ppsf - a.ppsf)
+    .slice(0, 5)
+    .map(l => ({ address: l.address, sqft: l.sqft, listPrice: l.listPrice, ppsf: l.ppsf, dom: l.dom }));
+
   return {
     count: listings.length,
     avgListPpsf,
     avgDom,
     flipListings: flipListings.length,
-    highPpsf: withPpsf.length ? Math.max(...withPpsf.map(l=>l.ppsf)) : null,
-    lowPpsf:  withPpsf.length ? Math.min(...withPpsf.map(l=>l.ppsf)) : null
+    highPpsf:  withPpsf.length ? Math.max(...withPpsf.map(l=>l.ppsf)) : null,
+    lowPpsf:   withPpsf.length ? Math.min(...withPpsf.map(l=>l.ppsf)) : null,
+    topByPpsf
   };
 }
 
@@ -523,7 +543,7 @@ function processComps(rawComps, subject, sqft, stateCode) {
 // PULL COMPS — 1 ATTOM call at max radius, filter client-side
 // ══════════════════════════════════════════════════════
 
-async function pullComps(lat, lon, propType, sqft) {
+async function pullComps(lat, lon, propType, sqft, subjectYearBuilt) {
   const raw = await attomSaleComps(lat, lon, 10); // 1 ATTOM call, pagesize 200
 
   // Property type filter (fall back to all if too few)
@@ -541,7 +561,20 @@ async function pullComps(lat, lon, propType, sqft) {
   const usable = pool.filter(c => c.sqft && (!sqft || Math.abs(c.sqft - sqft) <= 500));
   const flagged = usable.length < 3;
 
-  return { comps: pool, flagged };
+  // NEW CONSTRUCTION COMPS: filter from full pool for same-era builds (within 10 years of subject)
+  // Uses ±800sqft buffer (more forgiving — new construction beats vintage regardless of sqft diff)
+  let newConstrComps = [];
+  if (subjectYearBuilt && subjectYearBuilt >= new Date().getFullYear() - 10) {
+    const cutoffYr = subjectYearBuilt - 8;
+    newConstrComps = pool
+      .filter(c => c.yearBuilt && c.yearBuilt >= cutoffYr && c.sqft
+               && (!sqft || Math.abs(c.sqft - sqft) <= 800))
+      .sort((a, b) => (a.distanceMi||99) - (b.distanceMi||99))
+      .slice(0, 10);
+    console.log(`[newConstr] ${newConstrComps.length} same-era comps (built ${cutoffYr}+) in 10mi pool`);
+  }
+
+  return { comps: pool, flagged, newConstrComps };
 }
 
 // ══════════════════════════════════════════════════════
@@ -563,14 +596,20 @@ async function narrativeAgent(subject, compData, formulaData, pulse, callNotes) 
   ).join('\n');
 
   const pulseText = pulse
-    ? `Active market (2mi): ${pulse.count} listings · avg list $${pulse.avgListPpsf||'?'}/sqft · avg DOM ${pulse.avgDom??'?'} · ${pulse.flipListings} flip-priced listings (list 15%+ above sold avg)`
+    ? `Active market (2mi): ${pulse.count} listings · avg list $${pulse.avgListPpsf||'?'}/sqft · avg DOM ${pulse.avgDom??'?'} · ${pulse.flipListings} flip-priced listings · Top ceiling: $${pulse.topByPpsf?.[0]?.ppsf||'?'}/sqft`
     : 'Active listing data unavailable';
+
+  const ncComps = compData.newConstrComps || [];
+  const ncText  = ncComps.length
+    ? `Same-era comp sales (built within 8yr of subject, up to 10mi): ${ncComps.length} found · avg $${Math.round(ncComps.filter(c=>c.adjPpsf).reduce((s,c)=>s+c.adjPpsf,0)/Math.max(1,ncComps.filter(c=>c.adjPpsf).length))}/sqft adj`
+    : 'No same-era comp sales found in 10mi ATTOM pool';
 
   const userMsg =
 `Property: ${subject.address} | ${subject.sqft||'?'}sqft | ${subject.beds||'?'}bd/${subject.baths||'?'}ba | Built ${subject.yearBuilt||'?'} | ${subject.propertyType||'SFR'} | specs from ${subject.specsSource}
 Usable comps: ${compData.usable.length} (full data) + ${compData.incomplete.length} incomplete (no sqft)
 Radius: ${compData.maxRadius}mi · Avg $${compData.avgPpsf||'?'}/sqft · Range $${compData.ppsfRange?.min||'?'}–$${compData.ppsfRange?.max||'?'}/sqft · Avg DOM ${compData.avgDom||'?'}
 ${pulseText}
+${ncText}
 
 Comps:
 ${compLines || 'None with full data'}
@@ -635,6 +674,15 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     const flipNote = pulse.flipListings > 0 ? ` · ⚡ ${pulse.flipListings} flip-priced` : '';
     L.push(`🏠 *ACTIVE MARKET* (${pulse.count} listings · 2mi)`);
     L.push(`Avg list $${pulse.avgListPpsf||'?'}/sqft · DOM ${pulse.avgDom??'?'}${flipNote}`);
+
+    // Top listings by $/sqft = new-construction / renovated ceiling
+    if (pulse.topByPpsf?.length) {
+      L.push(`📈 *Top active listings (new-build / renovated ceiling):*`);
+      pulse.topByPpsf.forEach((l, i) => {
+        const addr = l.address ? l.address.split(',')[0] : '—';
+        L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'} · ${f(l.listPrice)} · $${l.ppsf}/sqft${l.dom!=null?' · DOM '+l.dom:''}`);
+      });
+    }
     L.push('');
   }
 
@@ -665,6 +713,27 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     });
     if (compData.usable.some(c=>c.zillowEnriched)) L.push('_✦ bed/bath enriched from Zillow_');
     if (compData.vintageGap >= 25) L.push('_📅 = years older than subject — adjustment applied but value is approximate_');
+    L.push('');
+  }
+
+  // New construction reference comps (same era, wider radius)
+  const nc = compData.newConstrComps || [];
+  if (nc.length) {
+    const ncPpsf = nc.filter(c=>c.adjPpsf).map(c=>c.adjPpsf);
+    const ncAvg  = ncPpsf.length ? Math.round(ncPpsf.reduce((a,b)=>a+b,0)/ncPpsf.length) : null;
+    L.push(`🏗️ *NEW CONSTRUCTION REFERENCE COMPS* (${nc.length} same-era sales · up to 10mi)`);
+    if (ncAvg) L.push(`Avg $${ncAvg}/sqft adj — _use this alongside vintage comps for new-build pricing_`);
+    nc.slice(0,5).forEach((c,i) => {
+      const enrichTag = c.zillowEnriched ? ' ✦' : '';
+      L.push(
+        `${i+1}. ${c.address||'—'} | ${c.sqft}sf ${c.beds||'?'}bd/${c.baths||'?'}ba built ${c.yearBuilt} ` +
+        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · $${c.adjPpsf}/sf adj${enrichTag}`
+      );
+    });
+    L.push('');
+  } else if (subject.yearBuilt && subject.yearBuilt >= new Date().getFullYear() - 10) {
+    L.push(`🏗️ *NEW CONSTRUCTION REFERENCE COMPS* — None found within 10mi in ATTOM`);
+    L.push(`_Active listing ceiling above is your best new-construction price signal_`);
     L.push('');
   }
 
@@ -743,7 +812,7 @@ app.post('/analyze', async (req, res) => {
 
     // 4. ATTOM (1 call) + Zillow sold + Zillow active — all in parallel
     const [compResult, zillowSoldData, activeListings] = await Promise.all([
-      pullComps(geo.lat, geo.lon, subject.propertyType, subject.sqft),
+      pullComps(geo.lat, geo.lon, subject.propertyType, subject.sqft, subject.yearBuilt),
       zillowSold(cityState),
       zillowActiveListings(geo.lat, geo.lon, 2)
     ]);
@@ -754,9 +823,13 @@ app.post('/analyze', async (req, res) => {
     const enrichCount = enriched.filter(c=>c.zillowEnriched).length;
     if (enrichCount) console.log(`[enrich] ${enrichCount} comps enriched from Zillow`);
 
+    // 5b. Enrich new construction comps too
+    const newConstrEnriched = enrichCompsWithZillow(compResult.newConstrComps || [], zillowSoldData);
+
     // 6. Process comps
     const compData = processComps(enriched, subject, subject.sqft, stateCode);
     if (compResult.flagged) compData.notes.push('Fewer than 3 usable comps found — treat with caution');
+    compData.newConstrComps = newConstrEnriched; // attach for formatter
 
     // 7. Market pulse
     const pulse = buildMarketPulse(activeListings, compData.avgPpsf);
