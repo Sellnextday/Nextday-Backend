@@ -62,16 +62,79 @@ function extractStateCode(address) {
 
 // ══════════════════════════════════════════════════════
 // GEOCODING — Nominatim (free, no API key needed)
+// 3-tier fallback: free-text → structured params → zip centroid
 // ══════════════════════════════════════════════════════
 
-async function geocodeAddress(address) {
+function expandAbbreviations(addr) {
+  return addr
+    .replace(/\bW\b/g, 'West').replace(/\bE\b/g, 'East')
+    .replace(/\bN\b/g, 'North').replace(/\bS\b/g, 'South')
+    .replace(/\bNE\b/g, 'Northeast').replace(/\bNW\b/g, 'Northwest')
+    .replace(/\bSE\b/g, 'Southeast').replace(/\bSW\b/g, 'Southwest')
+    .replace(/\bSt\b/g, 'Street').replace(/\bAve\b/g, 'Avenue')
+    .replace(/\bBlvd\b/g, 'Boulevard').replace(/\bDr\b/g, 'Drive')
+    .replace(/\bRd\b/g, 'Road').replace(/\bLn\b/g, 'Lane')
+    .replace(/\bCt\b/g, 'Court').replace(/\bPl\b/g, 'Place')
+    .replace(/\bCir\b/g, 'Circle').replace(/\bTer\b/g, 'Terrace');
+}
+
+async function nominatimQuery(params) {
   const res = await axios.get('https://nominatim.openstreetmap.org/search', {
-    params: { q: address, format: 'json', limit: 1, countrycodes: 'us' },
-    headers: { 'User-Agent': 'NextDayDealAnalyzer/1.0 (admin@sellnextday.com)' },
+    params: { format: 'json', limit: 1, countrycodes: 'us', ...params },
+    headers: { 'User-Agent': 'NextDayDealAnalyzer/3.1 (admin@sellnextday.com)' },
     timeout: 12000
   });
-  if (!res.data?.length) throw new Error('Address not found — check spelling or add city/state');
-  return { lat: parseFloat(res.data[0].lat), lon: parseFloat(res.data[0].lon) };
+  return res.data || [];
+}
+
+async function geocodeAddress(address) {
+  // Attempt 1: free-text, address as-is
+  let results = await nominatimQuery({ q: address });
+  if (results.length) {
+    console.log(`[geo] free-text match: ${results[0].display_name}`);
+    return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon) };
+  }
+
+  // Attempt 2: expanded abbreviations free-text
+  await new Promise(r => setTimeout(r, 1100)); // Nominatim rate limit
+  const expanded = expandAbbreviations(address);
+  if (expanded !== address) {
+    results = await nominatimQuery({ q: expanded });
+    if (results.length) {
+      console.log(`[geo] expanded match: ${results[0].display_name}`);
+      return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon) };
+    }
+  }
+
+  // Attempt 3: structured query — parse out street / city / state / zip
+  await new Promise(r => setTimeout(r, 1100));
+  const structMatch = address.match(/^(.*?),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})/);
+  if (structMatch) {
+    results = await nominatimQuery({
+      street:     expandAbbreviations(structMatch[1].trim()),
+      city:       structMatch[2].trim(),
+      state:      structMatch[3],
+      postalcode: structMatch[4],
+      country:    'US'
+    });
+    if (results.length) {
+      console.log(`[geo] structured match: ${results[0].display_name}`);
+      return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon) };
+    }
+  }
+
+  // Attempt 4: zip code centroid (most reliable fallback — good enough for radius comps)
+  await new Promise(r => setTimeout(r, 1100));
+  const zip = address.match(/\b(\d{5})\b/)?.[1];
+  if (zip) {
+    results = await nominatimQuery({ q: zip });
+    if (results.length) {
+      console.log(`[geo] zip centroid fallback: ${results[0].display_name}`);
+      return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon) };
+    }
+  }
+
+  throw new Error('Could not locate address — include full city, state, and ZIP (e.g., "913 W La Rua St, Pensacola, FL 32501")');
 }
 
 // ══════════════════════════════════════════════════════
