@@ -37,6 +37,21 @@ function parseSubjectSpecs(text) {
   const sqftM = text.match(/\b([\d,]{3,6})\s*(?:sq\.?\s*ft\.?|sqft|sf|square\s*f(?:eet|t)?)\b/i);
   if (sqftM) specs.sqft = parseInt(sqftM[1].replace(/,/g, ''));
 
+  // Fallback sqft: bare number after dash/space with no unit (e.g. "- 1776" or "address 1776")
+  // Accepts 400–9999, excludes year-range numbers (1800–2030)
+  if (!specs.sqft) {
+    const bareM = text.match(/[-–\s](\d{3,4})(?:\s|$)/g);
+    if (bareM) {
+      for (const chunk of bareM) {
+        const n = parseInt(chunk.match(/\d+/)[0]);
+        if (n >= 400 && n <= 9999 && !(n >= 1800 && n <= 2030)) {
+          specs.sqft = n;
+          break;
+        }
+      }
+    }
+  }
+
   // Property type keywords
   if (/manufactured|mobile\s*home/i.test(text))               specs.propertyType = 'MANUFACTURED';
   else if (/condo|condominium/i.test(text))                    specs.propertyType = 'CONDO';
@@ -53,11 +68,22 @@ function parseSubjectSpecs(text) {
 }
 
 function extractCityState(address) {
-  const m = address.match(/,\s*([^,]+),\s*([A-Z]{2})\s+\d{5}/);
-  if (m) return `${m[1].trim()}, ${m[2]}`;
-  const m2 = address.match(/([^,]+),\s*([A-Z]{2})\b/);
+  // Strip specs appended after em-dash or en-dash (e.g. "913 W La Rua St, Pensacola FL 32501 — 4bd 3ba 1460sf")
+  const clean = address.split(/\s*[—–]\s*/)[0].trim();
+
+  // Pattern 1: ", City, ST 12345"  (two commas — e.g. "109 Washington Ave, East Gadsden, AL 35903")
+  const m1 = clean.match(/,\s*([^,]+),\s*([A-Z]{2})\s+\d{5}/);
+  if (m1) return `${m1[1].trim()}, ${m1[2]}`;
+
+  // Pattern 2: ", City ST 12345"  (no comma between city and state — e.g. "913 W La Rua St, Pensacola FL 32501")
+  const m2 = clean.match(/,\s*([^,\d]+?)\s+([A-Z]{2})\s+\d{5}/);
   if (m2) return `${m2[1].trim()}, ${m2[2]}`;
-  return address;
+
+  // Pattern 3: "City, ST" anywhere
+  const m3 = clean.match(/([^,\d]+),\s*([A-Z]{2})\b/);
+  if (m3) return `${m3[1].trim()}, ${m3[2]}`;
+
+  return clean;
 }
 
 function extractStateCode(address) {
@@ -640,7 +666,7 @@ Call notes: ${callNotes||'none'}`;
 }
 
 // ══════════════════════════════════════════════════════
-// SLACK FORMATTER — v3.1
+// SLACK FORMATTER — v3.2
 // ══════════════════════════════════════════════════════
 
 function formatSlack(subject, compData, formulaData, narrative, pulse) {
