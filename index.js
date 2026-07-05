@@ -218,7 +218,10 @@ async function zillowSold(cityState) {
         timeout: 20000
       }
     );
-    return (res.data?.data?.items || []).map(p => ({
+    const items = res.data?.data?.items || [];
+    console.log(`[zillowSold] HTTP ${res.status} → ${items.length} results for "${cityState}" | top-level keys: ${Object.keys(res.data||{}).join(',')}`);
+    if (!items.length) console.log('[zillowSold] raw response:', JSON.stringify(res.data).slice(0, 400));
+    return items.map(p => ({
       address:     (p.address || `${p.address_line||''} ${p.city||''} ${p.state_code||''}`).trim(),
       addressLine: (p.address_line || '').toLowerCase().trim(),
       beds:        p.beds   || null,
@@ -228,7 +231,7 @@ async function zillowSold(cityState) {
       lon:         p.longitude || null
     }));
   } catch (err) {
-    console.warn('[zillowSold]', err.message);
+    console.warn('[zillowSold] ERROR:', err.message, err.response?.status, JSON.stringify(err.response?.data||{}).slice(0,200));
     return [];
   }
 }
@@ -259,20 +262,22 @@ async function zillowActiveListings(lat, lon, radiusMiles = 2) {
         timeout: 20000
       }
     );
-    return (res.data?.data?.items || [])
-      .filter(p => p.status === 'FOR_SALE' && p.list_price_usd)
-      .map(p => ({
-        address:   p.address || '',
-        beds:      p.beds   || null,
-        baths:     p.baths  || null,
-        sqft:      p.sqft   || null,
-        listPrice: p.list_price_usd || null,
-        dom:       p.days_on_market ?? null,
-        propType:  p.property_type  || null,
-        ppsf:      (p.list_price_usd && p.sqft) ? Math.round(p.list_price_usd / p.sqft) : null
-      }));
+    const allItems = res.data?.data?.items || [];
+    const forSale  = allItems.filter(p => p.status === 'FOR_SALE' && p.list_price_usd);
+    console.log(`[zillowActive] HTTP ${res.status} → ${allItems.length} total, ${forSale.length} FOR_SALE | bounds: ${JSON.stringify(bounds)}`);
+    if (!allItems.length) console.log('[zillowActive] raw response:', JSON.stringify(res.data).slice(0, 400));
+    return forSale.map(p => ({
+      address:   p.address || '',
+      beds:      p.beds   || null,
+      baths:     p.baths  || null,
+      sqft:      p.sqft   || null,
+      listPrice: p.list_price_usd || null,
+      dom:       p.days_on_market ?? null,
+      propType:  p.property_type  || null,
+      ppsf:      (p.list_price_usd && p.sqft) ? Math.round(p.list_price_usd / p.sqft) : null
+    }));
   } catch (err) {
-    console.warn('[zillowActive]', err.message);
+    console.warn('[zillowActive] ERROR:', err.message, err.response?.status, JSON.stringify(err.response?.data||{}).slice(0,200));
     return [];
   }
 }
@@ -377,8 +382,17 @@ function propAdj(comp, subject, stateCode) {
     const r = comp.lotSize / subject.lotSize;
     if (r > 2 || r < 0.5) adj += (subject.lotSize - comp.lotSize) * 43560 * 1.5;
   }
-  if (subject.yearBuilt && comp.yearBuilt) adj += ((subject.yearBuilt - comp.yearBuilt) / 10) * 500;
-  return Math.round(Math.max(-comp.saleAmt*0.25, Math.min(comp.saleAmt*0.25, adj)));
+  // Year-built adjustment — tiered scaling for large vintage gaps
+  if (subject.yearBuilt && comp.yearBuilt) {
+    const gapYrs = subject.yearBuilt - comp.yearBuilt;
+    const absGap = Math.abs(gapYrs);
+    let yrAdj = 0;
+    if (absGap <= 20)      yrAdj = absGap / 10 * 500;
+    else if (absGap <= 40) yrAdj = 20/10*500 + (absGap-20)/10 * 1500;
+    else                   yrAdj = 20/10*500 + 20/10*1500 + (absGap-40)/10 * 3000;
+    adj += Math.sign(gapYrs) * yrAdj;
+  }
+  return Math.round(Math.max(-comp.saleAmt*0.30, Math.min(comp.saleAmt*0.30, adj)));
 }
 
 function isFlip(comp) {
@@ -420,6 +434,20 @@ function certaintyScore(coreComps, subject, maxRadius) {
   if (!subject.sqft) dq -= 6; if (!subject.yearBuilt) dq -= 3;
   if (!subject.beds) dq -= 3; if (!subject.baths)     dq -= 3;
   s += Math.max(0, dq);
+
+  // Vintage penalty — new construction against aged inventory is unreliable
+  if (subject.yearBuilt) {
+    const compVintages = coreComps.filter(c=>c.yearBuilt).map(c=>c.yearBuilt);
+    if (compVintages.length) {
+      const avgVintage = compVintages.reduce((a,b)=>a+b,0)/compVintages.length;
+      const gap = subject.yearBuilt - avgVintage;
+      if (gap >= 40) s -= 25;
+      else if (gap >= 25) s -= 15;
+      else if (gap >= 15) s -= 8;
+    }
+  }
+
+  s = Math.max(0, Math.min(100, s));
   const label = s >= 85 ? 'High' : s >= 65 ? 'Moderate' : s >= 45 ? 'Low' : 'Thin data';
   return { score: s, label };
 }
@@ -475,13 +503,20 @@ function processComps(rawComps, subject, sqft, stateCode) {
   const domVals   = core.filter(c=>c.dom).map(c=>c.dom);
   const avgDom    = domVals.length ? Math.round(domVals.reduce((a,b)=>a+b,0)/domVals.length) : null;
 
+  // Vintage mismatch detection
+  const compVintages = core.filter(c=>c.yearBuilt).map(c=>c.yearBuilt);
+  const avgCompVintage = compVintages.length ? Math.round(compVintages.reduce((a,b)=>a+b,0)/compVintages.length) : null;
+  const vintageGap = (subject.yearBuilt && avgCompVintage) ? subject.yearBuilt - avgCompVintage : 0;
+
   const notes = [];
   if (flipCount)             notes.push(`${flipCount} flip-confirmed sale${flipCount>1?'s':''}`);
   if (outCount)              notes.push(`${outCount} outlier${outCount>1?'s':''} excluded`);
   if (incompleteRaw.length)  notes.push(`${incompleteRaw.length} comp${incompleteRaw.length>1?'s':''} missing sqft — excluded`);
+  if (vintageGap >= 25)      notes.push(`⚠️ Vintage gap ${vintageGap}yr — comps avg ${avgCompVintage}, subject built ${subject.yearBuilt}. Value likely understated.`);
 
   return { usable: tagged, incomplete: incompleteRaw, asIsValue, avgPpsf, ppsfRange,
-           certainty: cert, maxRadius, avgDom, flips: flipCount, outliers: outCount, notes };
+           certainty: cert, maxRadius, avgDom, flips: flipCount, outliers: outCount,
+           notes, avgCompVintage, vintageGap };
 }
 
 // ══════════════════════════════════════════════════════
@@ -543,6 +578,7 @@ ${compLines || 'None with full data'}
 As-Is Market Value: $${formulaData.asIsValue?.toLocaleString()||'N/A'}
 Novation MAO: $${formulaData.novationMao?.toLocaleString()||'N/A'}
 Certainty: ${compData.certainty?.score||0}% (${compData.certainty?.label})
+${compData.vintageGap >= 25 ? `⚠️ VINTAGE MISMATCH: subject built ${subject.yearBuilt}, comps avg ${compData.avgCompVintage} (${compData.vintageGap}yr gap). No same-vintage comps found — value is a floor estimate, new construction premium unverified.` : ''}
 Call notes: ${callNotes||'none'}`;
 
   try {
@@ -572,6 +608,14 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   const specTag = subject.specsSource === 'call notes' ? ' _(your call)_' : '';
   L.push(`${subject.propertyType||'SFR'} · ${subject.sqft?subject.sqft.toLocaleString()+' sqft':'sqft ?'} · ${subject.beds||'?'}bd/${subject.baths||'?'}ba · Built ${subject.yearBuilt||'?'}${specTag}`);
   L.push('');
+
+  // New construction / vintage mismatch alert
+  if (compData.vintageGap >= 25 && subject.yearBuilt) {
+    L.push(`🚨 *NEW CONSTRUCTION ALERT*`);
+    L.push(`Subject built ${subject.yearBuilt} — comps avg ${compData.avgCompVintage} (${compData.vintageGap}yr gap). No same-vintage sales found.`);
+    L.push(`_Value below is a floor estimate. True ARV is likely $${Math.round(compData.avgPpsf * 1.20)}-$${Math.round(compData.avgPpsf * 1.35)}/sqft — verify with agent or Zillow estimate._`);
+    L.push('');
+  }
 
   // Offer block
   L.push(`💰 *NOVATION OFFER*`);
@@ -609,15 +653,18 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   if (compData.usable.length) {
     L.push(`📋 *COMPS — FULL DATA* (${compData.usable.length})`);
     compData.usable.slice(0,8).forEach((c,i) => {
-      const enrichTag = c.zillowEnriched ? ' ✦' : '';
-      const flipTag   = c.flipComp ? ' ⚡FLIP' : '';
-      const outTag    = c.isOutlier ? ` ⚠️(${c.outlierNote?.split(',')[0]})` : '';
+      const enrichTag   = c.zillowEnriched ? ' ✦' : '';
+      const flipTag     = c.flipComp ? ' ⚡FLIP' : '';
+      const outTag      = c.isOutlier ? ` ⚠️(${c.outlierNote?.split(',')[0]})` : '';
+      const vintageYrs  = (subject.yearBuilt && c.yearBuilt) ? subject.yearBuilt - c.yearBuilt : 0;
+      const vintageTag  = vintageYrs >= 25 ? ` 📅-${vintageYrs}yr` : '';
       L.push(
         `${i+1}. ${c.address||'—'} | ${c.sqft}sf ${c.beds||'?'}bd/${c.baths||'?'}ba ${c.yearBuilt||'?'} ` +
-        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${enrichTag}${flipTag}${outTag}`
+        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${enrichTag}${flipTag}${outTag}${vintageTag}`
       );
     });
     if (compData.usable.some(c=>c.zillowEnriched)) L.push('_✦ bed/bath enriched from Zillow_');
+    if (compData.vintageGap >= 25) L.push('_📅 = years older than subject — adjustment applied but value is approximate_');
     L.push('');
   }
 
