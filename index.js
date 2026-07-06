@@ -941,14 +941,20 @@ app.post('/analyze', async (req, res) => {
     const newConstrEnriched = enrichCompsWithZillow(compResult.newConstrComps || [], zillowSoldData);
 
     // ── NON-DISCLOSURE STATE FALLBACK ────────────────────────────────────────
-    // In TX and other non-disclosure states, ATTOM returns properties with zero
-    // sale price. When that happens, attempt two fallbacks in order:
+    // In TX and other non-disclosure states, ATTOM returns deed-transfer records
+    // with $0 or nominal prices ($7,000 etc.) — not real arm's-length sales.
+    // Trigger the fallback when the state is non-disclosure AND there are no
+    // ATTOM comps with a plausible sale price (> $50k). This catches both the
+    // "0 records" case and the "records exist but all are transfers" case.
     //   1. Zillow sold items that do carry a price (MLS-reported or estimate)
     //   2. Active listing PPSF proxy (list × 0.97 sold-to-list ratio) when
     //      absolutely no sold price data is available from any source.
     let nonDisclosureMode = null; // 'zillow-sold' | 'active-proxy' | 'no-data'
 
-    if (isNonDisclosure && compResult.comps.length === 0) {
+    const meaningfulAttomComps = compResult.comps.filter(c => c.saleAmt && c.saleAmt > 50000);
+    console.log(`[nonDisclosure check] state=${stateCode} isND=${isNonDisclosure} attomTotal=${compResult.comps.length} meaningful=${meaningfulAttomComps.length}`);
+
+    if (isNonDisclosure && meaningfulAttomComps.length === 0) {
       const zillowComps = zillowSoldAsComps(zillowSoldData, geo.lat, geo.lon);
       console.log(`[nonDisclosure] Zillow sold with prices: ${zillowComps.length}`);
 
@@ -958,15 +964,20 @@ app.post('/analyze', async (req, res) => {
         nonDisclosureMode = 'zillow-sold';
         console.log(`[nonDisclosure] Using ${zillowComps.length} Zillow-sourced sold comps`);
       } else {
-        // No sold prices anywhere — compute active listing proxy
-        const activePpsfVals = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
-        const avgActivePpsf  = activePpsfVals.length
-          ? Math.round(activePpsfVals.reduce((a,b)=>a+b,0)/activePpsfVals.length)
+        // No sold prices anywhere — compute active listing proxy (outlier-filtered)
+        const _rawPpsf  = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
+        const _mean     = _rawPpsf.length ? _rawPpsf.reduce((a,b)=>a+b,0)/_rawPpsf.length : 0;
+        const _sd       = _rawPpsf.length >= 2
+          ? Math.sqrt(_rawPpsf.reduce((s,v)=>s+(v-_mean)**2,0)/_rawPpsf.length) : 0;
+        const _filtered = _rawPpsf.filter(v => Math.abs(v-_mean) <= 2*_sd);
+        const _vals     = _filtered.length ? _filtered : _rawPpsf;
+        const avgActivePpsf = _vals.length
+          ? Math.round(_vals.reduce((a,b)=>a+b,0)/_vals.length)
           : null;
 
         if (avgActivePpsf) {
           nonDisclosureMode = 'active-proxy';
-          console.log(`[nonDisclosure] Active proxy: $${avgActivePpsf}/sqft from ${activePpsfVals.length} listings`);
+          console.log(`[nonDisclosure] Active proxy: $${avgActivePpsf}/sqft from ${_vals.length} listings (${_rawPpsf.length - _vals.length} outliers removed)`);
         } else {
           nonDisclosureMode = 'no-data';
           console.log(`[nonDisclosure] No sold or active price data found`);
@@ -978,8 +989,15 @@ app.post('/analyze', async (req, res) => {
     let compData;
     if (nonDisclosureMode === 'active-proxy') {
       // Derive As-Is PPSF from active listings using a 97% sold-to-list ratio (TX typical)
-      const activePpsfVals = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
-      const avgActivePpsf  = Math.round(activePpsfVals.reduce((a,b)=>a+b,0)/activePpsfVals.length);
+      // Strip PPSF outliers first (±2 SD) to avoid commercial/multi-unit skewing the avg
+      const rawActivePpsf  = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
+      const ppsfMeanRaw    = rawActivePpsf.reduce((a,b)=>a+b,0) / rawActivePpsf.length;
+      const ppsfSd         = Math.sqrt(rawActivePpsf.reduce((s,v)=>s+(v-ppsfMeanRaw)**2,0)/rawActivePpsf.length);
+      const activePpsfVals = rawActivePpsf.filter(v => Math.abs(v - ppsfMeanRaw) <= 2 * ppsfSd);
+      const usedCount      = activePpsfVals.length || rawActivePpsf.length;
+      const avgActivePpsf  = Math.round((activePpsfVals.length ? activePpsfVals : rawActivePpsf).reduce((a,b)=>a+b,0) / usedCount);
+      const outlierCount   = rawActivePpsf.length - activePpsfVals.length;
+      if (outlierCount) console.log(`[nonDisclosure] active proxy: removed ${outlierCount} PPSF outlier(s), using ${usedCount} listings`);
       const estPpsf        = Math.round(avgActivePpsf * 0.97);
       const estAsIs        = subject.sqft ? Math.round(estPpsf * subject.sqft / 1000) * 1000 : null;
       const lowPpsf        = activePpsfVals.length ? Math.round(Math.min(...activePpsfVals) * 0.97) : estPpsf;
@@ -996,7 +1014,8 @@ app.post('/analyze', async (req, res) => {
         flips: 0, outliers: 0,
         notes: [
           `⚠️ ${stateCode} non-disclosure — ATTOM has no sale data, no Zillow sold prices found. ` +
-          `As-Is estimate derived from ${activePpsfVals.length} active listings (list × 0.97). ` +
+          `As-Is estimate derived from ${usedCount} active listings (list × 0.97 sold-to-list ratio)` +
+          `${outlierCount ? `; ${outlierCount} outlier(s) removed` : ''}. ` +
           `VERIFY WITH AGENT before presenting offer.`
         ],
         newConstrComps:  [],
