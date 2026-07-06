@@ -355,7 +355,16 @@ async function zillowActiveListings(lat, lon, radiusMiles = 2) {
       }
     );
     const allItems = res.data?.data?.items || [];
-    const forSale  = allItems.filter(p => p.status === 'FOR_SALE' && p.list_price_usd);
+    const forSaleRaw = allItems.filter(p => p.status === 'FOR_SALE' && p.list_price_usd);
+
+    // Deduplicate: same list price + sqft within 5sf = same property listed twice
+    const seen = new Set();
+    const forSale = forSaleRaw.filter(p => {
+      const key = `${p.list_price_usd}_${Math.round(p.sqft||0)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     console.log(`[zillowActive] HTTP ${res.status} → ${allItems.length} total, ${forSale.length} FOR_SALE | bounds: ${JSON.stringify(bounds)}`);
     if (!allItems.length) console.log('[zillowActive] raw response:', JSON.stringify(res.data).slice(0, 400));
     return forSale.map(p => ({
@@ -436,11 +445,28 @@ function enrichCompsWithZillow(attomComps, zillowData) {
 
 function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null, subjectYearBuilt = null) {
   if (!listings.length) return null;
-  const withPpsf    = listings.filter(l => l.ppsf);
+
+  // Pre-filter: remove multi-family, units, and commercial listings
+  // - "219-221 Main St" style (address range) = multi-unit building
+  // - "#221" / "Apt 3" / "Unit B" in address = individual unit in multi-family
+  // - propType signals non-SFR
+  const isSFR = l => {
+    const addr = (l.address || '').trim();
+    if (/\s#\d/i.test(addr))          return false; // has unit # → condo/apt
+    if (/\bUnit\b|\bApt\b|\bSte\b/i.test(addr)) return false;
+    if (/^\d+-\d+\s/.test(addr))      return false; // "219-221 Main St" = multi-unit range
+    if (l.propType && /multi|duplex|condo|apt|townhome|townhouse/i.test(l.propType)) return false;
+    return true;
+  };
+  const sfr = listings.filter(isSFR);
+  const excludedCount = listings.length - sfr.length;
+  if (excludedCount) console.log(`[pulse] excluded ${excludedCount} non-SFR listing(s) from active market`);
+
+  const withPpsf    = sfr.filter(l => l.ppsf);
   const avgListPpsf = withPpsf.length ? Math.round(withPpsf.reduce((s,l)=>s+l.ppsf,0)/withPpsf.length) : null;
-  const withDom     = listings.filter(l => l.dom !== null && l.dom !== undefined);
+  const withDom     = sfr.filter(l => l.dom !== null && l.dom !== undefined);
   const avgDom      = withDom.length ? Math.round(withDom.reduce((s,l)=>s+l.dom,0)/withDom.length) : null;
-  const flipListings = avgSoldPpsf ? listings.filter(l => l.ppsf && l.ppsf >= avgSoldPpsf * 1.15) : [];
+  const flipListings = avgSoldPpsf ? sfr.filter(l => l.ppsf && l.ppsf >= avgSoldPpsf * 1.15) : [];
 
   // Identify new builds:
   //   - year_built captured from API AND built within last 8 years (or 15+ years newer than subject)
@@ -489,7 +515,8 @@ function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null, subjectYear
     .map(l => ({ address: l.address, sqft: l.sqft, listPrice: l.listPrice, ppsf: l.ppsf, dom: l.dom, yearBuilt: l.yearBuilt }));
 
   return {
-    count: listings.length,
+    count:           sfr.length,           // SFR-only count (after removing multi-family/units)
+    totalRaw:        listings.length,       // raw count before filtering
     avgListPpsf,
     avgDom,
     flipListings:    flipListings.length,
@@ -869,7 +896,7 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push('');
   }
 
-  // Comp list
+  // Comp list with reasoning
   if (compData.usable.length) {
     L.push(`📋 *COMPS — FULL DATA* (${compData.usable.length})`);
     compData.usable.slice(0,8).forEach((c,i) => {
@@ -878,9 +905,28 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
       const outTag      = c.isOutlier ? ` ⚠️(${c.outlierNote?.split(',')[0]})` : '';
       const vintageYrs  = (subject.yearBuilt && c.yearBuilt) ? subject.yearBuilt - c.yearBuilt : 0;
       const vintageTag  = vintageYrs >= 25 ? ` 📅-${vintageYrs}yr` : '';
+
+      // Reasoning notes — why this comp was used / what to watch
+      const reasons = [];
+      if (subject.sqft && c.sqft) {
+        const diff = c.sqft - subject.sqft;
+        if (Math.abs(diff) <= 150)       reasons.push(`similar sqft`);
+        else if (diff > 0)               reasons.push(`+${diff}sf vs subject — adj applied`);
+        else                             reasons.push(`${diff}sf vs subject — adj applied`);
+        // Flag: small homes carry higher $/sqft — their adj ppsf inflates the avg for larger subjects
+        if (c.sqft < subject.sqft * 0.80) reasons.push(`⚠️ significantly smaller — $/sqft premium baked in`);
+      }
+      if (subject.yearBuilt && c.yearBuilt) {
+        const gap = subject.yearBuilt - c.yearBuilt;
+        if (Math.abs(gap) <= 5)           reasons.push(`same era`);
+        else if (gap > 15)                reasons.push(`comp is ${gap}yr older`);
+        else if (gap < -10)               reasons.push(`comp is ${Math.abs(gap)}yr newer`);
+      }
+      const reasonTag = reasons.length ? `\n      _↳ ${reasons.join(' · ')}_` : '';
+
       L.push(
         `${i+1}. ${c.address||'—'} | ${c.sqft}sf ${c.beds||'?'}bd/${c.baths||'?'}ba ${c.yearBuilt||'?'} ` +
-        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${sourceTag}${flipTag}${outTag}${vintageTag}`
+        `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${sourceTag}${flipTag}${outTag}${vintageTag}${reasonTag}`
       );
     });
     L.push('_Source: County = ATTOM county records  ·  County+Zillow = county records + Zillow enrichment  ·  Zillow MLS = non-disclosure state fallback_');
@@ -951,13 +997,30 @@ app.post('/analyze', async (req, res) => {
     // 1. Parse subject specs from call notes
     const parsed = parseSubjectSpecs((callNotes || '') + ' ' + address);
 
-    // 2. Ask for sqft if not in message
+    // 2. Ask for specs if sqft is missing — sqft is required, everything else sharpens the number
     if (!parsed.sqft) {
       return res.json({
         needs_sqft: true,
-        message: `Got *${address}*. Need the square footage from the call — reply with the address and include it, e.g.:\n_913 W La Rua, Pensacola FL — 4bd 3ba 1460sf built 2024_`
+        message: [
+          `Got *${address}*. Before I run the numbers — do you have the property specs from the call?`,
+          ``,
+          `The more you give me, the tighter the estimate:`,
+          `• *Square footage* — required to calculate As-Is Value (e.g. \`1849sf\` or \`1849 sqft\`)`,
+          `• *Beds / baths* — used to adjust comps (e.g. \`3bd 2ba\`)`,
+          `• *Year built* — flags vintage gaps vs comps (e.g. \`built 1996\`)`,
+          ``,
+          `Reply with the address + whatever you have, e.g.:`,
+          `_129 E Beshoar Dr, Pueblo CO — 3bd 2ba 1849sf built 1996_`
+        ].join('\n')
       });
     }
+
+    // 2b. Sqft found — note any missing specs so the user knows adjustments are partial
+    const missingSpecs = [
+      !parsed.beds      ? 'beds'       : null,
+      !parsed.baths     ? 'baths'      : null,
+      !parsed.yearBuilt ? 'year built' : null,
+    ].filter(Boolean);
 
     // 3. Geocode (Nominatim — free, no ATTOM call needed)
     let geo;
@@ -1140,6 +1203,31 @@ app.post('/analyze', async (req, res) => {
     const formulaData      = { asIsValue, novationMao, novationListPrice };
     console.log(`[formula] AsIs:${asIsValue} MAO:${novationMao} nonDisclosureMode:${nonDisclosureMode||'none'}`);
 
+    // 8b. Pricing sanity check — compare list price against stale active comps
+    // If our As-Is Value is within 10% of a listing that's been sitting 60+ days,
+    // that's a market signal the price is too high for the area to absorb.
+    const staleComparables = activeListings.filter(l =>
+      l.listPrice && l.dom != null && l.dom >= 60 &&
+      formulaData.asIsValue &&
+      Math.abs(l.listPrice - formulaData.asIsValue) / formulaData.asIsValue <= 0.10
+    );
+    if (staleComparables.length) {
+      const sc = staleComparables[0];
+      compData.notes.push(
+        `⚠️ Pricing alert: list price ($${formulaData.asIsValue?.toLocaleString()}) is within 10% of ` +
+        `${sc.address?.split(',')[0] || 'a nearby listing'} ($${sc.listPrice?.toLocaleString()}, ${sc.dom} DOM) — ` +
+        `that property is already stale at this price. Consider pricing below it.`
+      );
+    }
+
+    // 8c. Warn when key subject specs are missing — adjustments will be less precise
+    if (missingSpecs.length > 0) {
+      compData.notes.push(
+        `ℹ️ Subject missing: ${missingSpecs.join(', ')} — comp adjustments less accurate. ` +
+        `Next time include them, e.g. _3bd 2ba built 1996_ in your message.`
+      );
+    }
+
     // 9. Narrative (1 Anthropic call)
     const narrative = await narrativeAgent(subject, compData, formulaData, pulse, callNotes);
 
@@ -1209,13 +1297,49 @@ app.get('/last-deal', (req, res) => {
   res.json(lastDeal);
 });
 
+// ── Temporary schema probe — hit /debug-zillow?lat=29.79&lon=-94.79 to see raw Zillow fields ──
+app.get('/debug-zillow', async (req, res) => {
+  const lat = parseFloat(req.query.lat || '29.79');
+  const lon = parseFloat(req.query.lon || '-94.79');
+  const dLat = 0.02898, dLon = 0.033;
+  try {
+    const r = await axios.post(
+      `https://${ZILLOW_HOST}/zillow/v1/search_by_coordinates`,
+      { map_bounds: { west: lon-dLon, east: lon+dLon, south: lat-dLat, north: lat+dLat } },
+      { headers: { 'Content-Type':'application/json', 'x-rapidapi-host': ZILLOW_HOST, 'x-rapidapi-key': RAPIDAPI_KEY }, timeout: 20000 }
+    );
+    const items = r.data?.data?.items || [];
+    const first = items[0] || null;
+    res.json({ count: items.length, fields: first ? Object.keys(first) : [], firstItem: first });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Same probe for sold endpoint ──
+app.get('/debug-zillow-sold', async (req, res) => {
+  const location = req.query.location || 'Liberty, TX';
+  try {
+    const r = await axios.post(
+      `https://${ZILLOW_HOST}/zillow/v1/sold`,
+      { location },
+      { headers: { 'Content-Type':'application/json', 'x-rapidapi-host': ZILLOW_HOST, 'x-rapidapi-key': RAPIDAPI_KEY }, timeout: 20000 }
+    );
+    const items = r.data?.data?.items || [];
+    const first = items[0] || null;
+    res.json({ count: items.length, fields: first ? Object.keys(first) : [], firstItem: first });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/health', (req, res) =>
   res.json({
-    status: 'ok', version: '3.3',
+    status: 'ok', version: '3.4',
     attom: !!ATTOM_KEY, zillow: !!RAPIDAPI_KEY, anthropic: !!ANTHROPIC_KEY,
     lastDeal: lastDeal ? { address: lastDeal.address, analyzedAt: lastDeal.analyzedAt } : null
   })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Deal Analyzer v3.3 (ATTOM + Zillow + non-disclosure fallback + deal memory) on :${PORT}`));
+app.listen(PORT, () => console.log(`Deal Analyzer v3.4 (ATTOM + Zillow + non-disclosure + spec prompt + SFR filter + new builds + stale DOM + comp reasoning) on :${PORT}`));
