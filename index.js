@@ -441,10 +441,10 @@ function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null) {
   const avgDom      = withDom.length ? Math.round(withDom.reduce((s,l)=>s+l.dom,0)/withDom.length) : null;
   const flipListings = avgSoldPpsf ? listings.filter(l => l.ppsf && l.ppsf >= avgSoldPpsf * 1.15) : [];
 
-  // Top active listings by $/sqft — filter to sqft-comparable listings (±50% of subject)
-  // so a 880sf commercial lot doesn't show as a ceiling for a 1,750sf SFR
+  // Top active listings by $/sqft — filter to sqft-comparable listings (±35% of subject)
+  // Tight enough to exclude 880sf commercial listings and 3,000sf+ outliers from a 1,750sf SFR pool
   const comparable = subjectSqft
-    ? withPpsf.filter(l => !l.sqft || (l.sqft >= subjectSqft * 0.50 && l.sqft <= subjectSqft * 1.50))
+    ? withPpsf.filter(l => !l.sqft || (l.sqft >= subjectSqft * 0.65 && l.sqft <= subjectSqft * 1.35))
     : withPpsf;
   const topPool = comparable.length >= 3 ? comparable : withPpsf; // fall back to all if too few
   const topByPpsf = [...topPool]
@@ -983,10 +983,10 @@ app.post('/analyze', async (req, res) => {
         console.log(`[nonDisclosure] Using ${zillowComps.length} Zillow-sourced sold comps`);
       } else {
         // No sold prices anywhere — compute active listing proxy
-        // Step 1: filter to sqft-comparable listings (±40% of subject sqft) so an
+        // Step 1: filter to sqft-comparable listings (±35% of subject sqft) so an
         //         880sf commercial lot doesn't skew the price estimate for a 1,750sf SFR
-        const _sqftMin  = subject.sqft ? subject.sqft * 0.60 : 0;
-        const _sqftMax  = subject.sqft ? subject.sqft * 1.40 : Infinity;
+        const _sqftMin  = subject.sqft ? subject.sqft * 0.65 : 0;
+        const _sqftMax  = subject.sqft ? subject.sqft * 1.35 : Infinity;
         const _sqftComp = activeListings.filter(l => l.ppsf && (!l.sqft || (l.sqft >= _sqftMin && l.sqft <= _sqftMax)));
         const _rawPpsf  = (_sqftComp.length >= 3 ? _sqftComp : activeListings.filter(l => l.ppsf)).map(l => l.ppsf);
         // Step 2: outlier-filter (±2 SD)
@@ -1013,9 +1013,9 @@ app.post('/analyze', async (req, res) => {
     let compData;
     if (nonDisclosureMode === 'active-proxy') {
       // Derive As-Is PPSF from active listings using a 97% sold-to-list ratio (TX typical)
-      // Step 1: sqft-comparable listings (±40% of subject sqft)
-      const sqftMin        = subject.sqft ? subject.sqft * 0.60 : 0;
-      const sqftMax        = subject.sqft ? subject.sqft * 1.40 : Infinity;
+      // Step 1: sqft-comparable listings (±35% of subject sqft)
+      const sqftMin        = subject.sqft ? subject.sqft * 0.65 : 0;
+      const sqftMax        = subject.sqft ? subject.sqft * 1.35 : Infinity;
       const sqftCompList   = activeListings.filter(l => l.ppsf && (!l.sqft || (l.sqft >= sqftMin && l.sqft <= sqftMax)));
       const baseList       = sqftCompList.length >= 3 ? sqftCompList : activeListings.filter(l => l.ppsf);
       // Step 2: outlier-filter (±2 SD)
