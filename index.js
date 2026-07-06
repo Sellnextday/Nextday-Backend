@@ -267,10 +267,12 @@ async function zillowSold(cityState) {
       sqft:        p.sqft   || null,
       lat:         p.latitude  || null,
       lon:         p.longitude || null,
-      // Sale price — present in some Zillow API responses (especially non-disclosure states via MLS data)
-      saleAmt:     p.price || p.last_sold_price || p.sold_price || p.last_sale_price || null,
+      // sold_price_usd is the direct field; fall back to legacy field names
+      saleAmt:     p.sold_price_usd || p.price || p.last_sold_price || p.sold_price || p.last_sale_price || null,
       saleDate:    p.sold_date || p.last_sold_date || p.date_sold || p.last_sale_date || null,
-      dom:         p.days_on_market || null
+      dom:         p.days_on_market || null,
+      imgUrl:      p.photos?.[0] || null,
+      zillowUrl:   p.url || null
     }));
   } catch (err) {
     console.warn('[zillowSold] ERROR:', err.message, err.response?.status, JSON.stringify(err.response?.data||{}).slice(0,200));
@@ -376,7 +378,9 @@ async function zillowActiveListings(lat, lon, radiusMiles = 2) {
       dom:       p.days_on_market ?? null,
       propType:  p.property_type  || null,
       yearBuilt: p.year_built || p.yearBuilt || p.built_year || null,
-      ppsf:      (p.list_price_usd && p.sqft) ? Math.round(p.list_price_usd / p.sqft) : null
+      ppsf:      (p.list_price_usd && p.sqft) ? Math.round(p.list_price_usd / p.sqft) : null,
+      imgUrl:    p.photos?.[0] || null,
+      zillowUrl: p.url || null
     }));
   } catch (err) {
     console.warn('[zillowActive] ERROR:', err.message, err.response?.status, JSON.stringify(err.response?.data||{}).slice(0,200));
@@ -499,13 +503,16 @@ function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null, subjectYear
     .sort((a, b) => b.ppsf - a.ppsf)
     .slice(0, 5)
     .map(l => ({
-      address:   l.address,
-      sqft:      l.sqft,
-      listPrice: l.listPrice,
-      ppsf:      l.ppsf,
-      dom:       l.dom,
-      yearBuilt: l.yearBuilt,
-      stale:     isStale(l)    // flag for display: DOM 150+ = overpriced, will come down
+      address:       l.address,
+      sqft:          l.sqft,
+      listPrice:     l.listPrice,
+      ppsf:          l.ppsf,
+      dom:           l.dom,
+      yearBuilt:     l.yearBuilt,
+      stale:         isStale(l),      // flag for display: DOM 150+ = overpriced, will come down
+      condition:     l.condition     || null,   // 'Updated' | 'Partial' | 'Dated' — from photo AI
+      conditionNote: l.conditionNote || null,   // e.g. "granite counters, LVP floors"
+      zillowUrl:     l.zillowUrl     || null
     }));
 
   // Top new build listings (separate ceiling section)
@@ -740,6 +747,63 @@ async function pullComps(lat, lon, propType, sqft, subjectYearBuilt) {
 }
 
 // ══════════════════════════════════════════════════════
+// PHOTO CONDITION ASSESSMENT — Haiku vision, batched
+// Classifies active listing photos as Updated / Partial / Dated
+// Returns { [address]: { condition, note } }
+// ══════════════════════════════════════════════════════
+
+async function assessConditionFromPhotos(listings) {
+  const withPhotos = listings.filter(l => l.imgUrl).slice(0, 5);
+  if (!withPhotos.length) return {};
+  console.log(`[photoCondition] assessing ${withPhotos.length} listing photos`);
+
+  try {
+    // Build interleaved text + image content
+    const content = [
+      {
+        type: 'text',
+        text: [
+          `You are reviewing ${withPhotos.length} property listing photo(s) to assess renovation condition.`,
+          `Classify each as exactly one of:`,
+          `• "Updated" — modern finishes clearly visible: new kitchen cabinets/counters, renovated bath, LVP/hardwood flooring, fresh neutral paint, updated fixtures`,
+          `• "Partial" — mix of old and new: maybe one room updated, rest original; or cosmetic updates only (paint) with dated mechanicals visible`,
+          `• "Dated" — clearly original/unrenovated: old carpet, oak cabinets, laminate counters, popcorn ceiling, dated fixtures, no visible updates`,
+          ``,
+          `Reply ONLY with a JSON array, one object per photo:`,
+          `[{"index":0,"condition":"Updated","note":"granite counters, white shaker cabinets, LVP floors visible"},...]`,
+          `Be specific in the note — say what you actually see, not just the label.`
+        ].join('\n')
+      }
+    ];
+
+    withPhotos.forEach((l, i) => {
+      content.push({ type: 'text', text: `Photo ${i} — ${l.address || 'Property ' + i}:` });
+      content.push({ type: 'image', source: { type: 'url', url: l.imgUrl } });
+    });
+
+    const res = await axios({
+      method: 'post', url: 'https://api.anthropic.com/v1/messages', timeout: 30000,
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      data: { model: 'claude-haiku-4-5-20251001', max_tokens: 600, messages: [{ role: 'user', content }] }
+    });
+
+    const raw  = res.data.content?.find(b => b.type === 'text')?.text || '[]';
+    const arr  = JSON.parse(raw.match(/\[[\s\S]*\]/)?.[0] || '[]');
+    const map  = {};
+    arr.forEach(r => {
+      if (r.index != null && withPhotos[r.index]) {
+        map[withPhotos[r.index].address] = { condition: r.condition, note: r.note };
+      }
+    });
+    console.log(`[photoCondition] results: ${JSON.stringify(map)}`);
+    return map;
+  } catch (err) {
+    console.warn('[photoCondition] ERROR:', err.message);
+    return {};
+  }
+}
+
+// ══════════════════════════════════════════════════════
 // NARRATIVE AGENT
 // ══════════════════════════════════════════════════════
 
@@ -853,11 +917,21 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     if (pulse.topByPpsf?.length) {
       L.push(`📈 *Comparable active listings:*`);
       pulse.topByPpsf.forEach((l, i) => {
-        const addr     = l.address ? l.address.split(',')[0] : '—';
-        const staleTag = l.stale ? ' ⚠️ 150+ DOM — price likely dropping' : '';
-        const yrTag    = l.yearBuilt ? ` built ${l.yearBuilt}` : '';
-        L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'}${yrTag} · ${f(l.listPrice)} · $${l.ppsf}/sqft · DOM ${l.dom??'?'}${staleTag}`);
+        const addr      = l.address ? l.address.split(',')[0] : '—';
+        const staleTag  = l.stale ? ' ⚠️ 150+ DOM — price likely dropping' : '';
+        const yrTag     = l.yearBuilt ? ` built ${l.yearBuilt}` : '';
+        const condIcon  = l.condition === 'Updated' ? '✅' : l.condition === 'Partial' ? '🔶' : l.condition === 'Dated' ? '🔴' : '';
+        const condTag   = l.condition ? ` · ${condIcon} ${l.condition}` : '';
+        const condNote  = l.conditionNote ? `\n      _↳ ${l.conditionNote}_` : '';
+        L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'}${yrTag} · ${f(l.listPrice)} · $${l.ppsf}/sqft · DOM ${l.dom??'?'}${staleTag}${condTag}${condNote}`);
       });
+
+      // Warn if all assessed comps appear updated — subject may be worth less
+      const assessed = pulse.topByPpsf.filter(l => l.condition);
+      const updatedCount = assessed.filter(l => l.condition === 'Updated').length;
+      if (assessed.length >= 3 && updatedCount === assessed.length) {
+        L.push(`  _⚠️ All comparable listings appear renovated — if subject is dated/original, actual As-Is value may be lower than estimated_`);
+      }
     }
 
     // New builds in the area — shown separately as a ceiling, NOT used in price estimate
@@ -1220,7 +1294,7 @@ app.post('/analyze', async (req, res) => {
       );
     }
 
-    // 8c. Warn when key subject specs are missing — adjustments will be less precise
+    // 8b. Warn when key subject specs are missing — adjustments will be less precise
     if (missingSpecs.length > 0) {
       compData.notes.push(
         `ℹ️ Subject missing: ${missingSpecs.join(', ')} — comp adjustments less accurate. ` +
@@ -1228,11 +1302,21 @@ app.post('/analyze', async (req, res) => {
       );
     }
 
-    // 9. Narrative (1 Anthropic call)
-    const narrative = await narrativeAgent(subject, compData, formulaData, pulse, callNotes);
+    // 9. Narrative + photo condition assessment — run in parallel (both are Anthropic calls)
+    const [narrative, conditionMap] = await Promise.all([
+      narrativeAgent(subject, compData, formulaData, pulse, callNotes),
+      assessConditionFromPhotos(activeListings)
+    ]);
+
+    // 9b. Attach condition tags to active listings, then rebuild pulse so topByPpsf carries them
+    activeListings.forEach(l => {
+      const c = conditionMap[l.address];
+      if (c) { l.condition = c.condition; l.conditionNote = c.note; }
+    });
+    const pulseWithConditions = buildMarketPulse(activeListings, compData.avgPpsf, subject.sqft, subject.yearBuilt);
 
     // 10. Format and return
-    const slackMessage = formatSlack(subject, compData, formulaData, narrative, pulse);
+    const slackMessage = formatSlack(subject, compData, formulaData, narrative, pulseWithConditions);
 
     // 11. Store deal in memory so JARVIS can answer follow-up questions
     lastDeal = {
@@ -1335,11 +1419,11 @@ app.get('/debug-zillow-sold', async (req, res) => {
 
 app.get('/health', (req, res) =>
   res.json({
-    status: 'ok', version: '3.4',
+    status: 'ok', version: '3.5',
     attom: !!ATTOM_KEY, zillow: !!RAPIDAPI_KEY, anthropic: !!ANTHROPIC_KEY,
     lastDeal: lastDeal ? { address: lastDeal.address, analyzedAt: lastDeal.analyzedAt } : null
   })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Deal Analyzer v3.4 (ATTOM + Zillow + non-disclosure + spec prompt + SFR filter + new builds + stale DOM + comp reasoning) on :${PORT}`));
+app.listen(PORT, () => console.log(`Deal Analyzer v3.5 (+ photo condition assessment: Updated/Partial/Dated via Haiku vision, parallel with narrative) on :${PORT}`));
