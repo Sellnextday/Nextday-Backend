@@ -433,7 +433,7 @@ function enrichCompsWithZillow(attomComps, zillowData) {
 // ACTIVE MARKET PULSE
 // ══════════════════════════════════════════════════════
 
-function buildMarketPulse(listings, avgSoldPpsf) {
+function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null) {
   if (!listings.length) return null;
   const withPpsf    = listings.filter(l => l.ppsf);
   const avgListPpsf = withPpsf.length ? Math.round(withPpsf.reduce((s,l)=>s+l.ppsf,0)/withPpsf.length) : null;
@@ -441,8 +441,13 @@ function buildMarketPulse(listings, avgSoldPpsf) {
   const avgDom      = withDom.length ? Math.round(withDom.reduce((s,l)=>s+l.dom,0)/withDom.length) : null;
   const flipListings = avgSoldPpsf ? listings.filter(l => l.ppsf && l.ppsf >= avgSoldPpsf * 1.15) : [];
 
-  // Top active listings by $/sqft — likely new construction / fully renovated ceiling
-  const topByPpsf = [...withPpsf]
+  // Top active listings by $/sqft — filter to sqft-comparable listings (±50% of subject)
+  // so a 880sf commercial lot doesn't show as a ceiling for a 1,750sf SFR
+  const comparable = subjectSqft
+    ? withPpsf.filter(l => !l.sqft || (l.sqft >= subjectSqft * 0.50 && l.sqft <= subjectSqft * 1.50))
+    : withPpsf;
+  const topPool = comparable.length >= 3 ? comparable : withPpsf; // fall back to all if too few
+  const topByPpsf = [...topPool]
     .sort((a, b) => b.ppsf - a.ppsf)
     .slice(0, 5)
     .map(l => ({ address: l.address, sqft: l.sqft, listPrice: l.listPrice, ppsf: l.ppsf, dom: l.dom }));
@@ -452,9 +457,10 @@ function buildMarketPulse(listings, avgSoldPpsf) {
     avgListPpsf,
     avgDom,
     flipListings: flipListings.length,
-    highPpsf:  withPpsf.length ? Math.max(...withPpsf.map(l=>l.ppsf)) : null,
-    lowPpsf:   withPpsf.length ? Math.min(...withPpsf.map(l=>l.ppsf)) : null,
-    topByPpsf
+    highPpsf:    withPpsf.length ? Math.max(...withPpsf.map(l=>l.ppsf)) : null,
+    lowPpsf:     withPpsf.length ? Math.min(...withPpsf.map(l=>l.ppsf)) : null,
+    topByPpsf,
+    comparableCount: comparable.length
   };
 }
 
@@ -779,9 +785,12 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push(`🏠 *ACTIVE MARKET* (${pulse.count} listings · 2mi)`);
     L.push(`Avg list $${pulse.avgListPpsf||'?'}/sqft · DOM ${pulse.avgDom??'?'}${flipNote}`);
 
-    // Top listings by $/sqft = new-construction / renovated ceiling
+    // Top listings by $/sqft — filtered to sqft-comparable properties (±50% of subject)
     if (pulse.topByPpsf?.length) {
-      L.push(`📈 *Top active listings (new-build / renovated ceiling):*`);
+      const compLabel = pulse.comparableCount != null
+        ? ` · ${pulse.comparableCount} sqft-comparable`
+        : '';
+      L.push(`📈 *Top comparable active listings (size-filtered ceiling):*${compLabel}`);
       pulse.topByPpsf.forEach((l, i) => {
         const addr = l.address ? l.address.split(',')[0] : '—';
         L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'} · ${f(l.listPrice)} · $${l.ppsf}/sqft${l.dom!=null?' · DOM '+l.dom:''}`);
@@ -790,19 +799,28 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push('');
   }
 
-  // Sold comps summary
-  const compSourceLabel = compData.usable.some(c => c.zillowSource)
-    ? 'Zillow MLS · 15mo'
-    : 'ATTOM County · 15mo';
-  L.push(`📊 *SOLD COMPS* (${compData.usable.length} usable · ${compData.maxRadius}mi · ${compSourceLabel})`);
-  if (compData.avgPpsf) {
-    L.push(`Avg $${compData.avgPpsf}/sqft · Range $${compData.ppsfRange?.min}–$${compData.ppsfRange?.max}/sqft${compData.avgDom?' · DOM avg '+compData.avgDom:''}`);
+  // Sold comps section — different display for active-proxy vs real comps
+  if (compData.certainty?.label === 'Active proxy only') {
+    // Non-disclosure with no sold data — show this clearly as a proxy, not sold comps
+    L.push(`📊 *ACTIVE PRICE PROXY* _(no sold data available — TX non-disclosure state)_`);
+    L.push(`Est. As-Is PPSF: ~$${compData.avgPpsf}/sqft _(sqft-comparable active listings × 0.97 sold-to-list)_`);
+    L.push(`_How we got As-Is Value: avg list price of comparable active listings → apply 97% sold-to-list ratio → multiply by subject sqft_`);
+    L.push(`_Your novation formula then runs on top: As-Is × 0.93 − $50K = MAO_`);
+    L.push('');
   } else {
-    L.push(`Insufficient data to calculate avg $/sqft`);
+    const compSourceLabel = compData.usable.some(c => c.zillowSource)
+      ? 'Zillow MLS · 15mo'
+      : 'ATTOM County · 15mo';
+    L.push(`📊 *SOLD COMPS* (${compData.usable.length} usable · ${compData.maxRadius}mi · ${compSourceLabel})`);
+    if (compData.avgPpsf) {
+      L.push(`Avg $${compData.avgPpsf}/sqft · Range $${compData.ppsfRange?.min}–$${compData.ppsfRange?.max}/sqft${compData.avgDom?' · DOM avg '+compData.avgDom:''}`);
+    } else {
+      L.push(`Insufficient data to calculate avg $/sqft`);
+    }
+    if (compData.flips)    L.push(`⚡ ${compData.flips} flip-confirmed sale${compData.flips>1?'s':''}`);
+    if (compData.outliers) L.push(`⚠️ ${compData.outliers} outlier${compData.outliers>1?'s':''} — excluded from avg`);
+    L.push('');
   }
-  if (compData.flips)    L.push(`⚡ ${compData.flips} flip-confirmed sale${compData.flips>1?'s':''}`);
-  if (compData.outliers) L.push(`⚠️ ${compData.outliers} outlier${compData.outliers>1?'s':''} — excluded from avg`);
-  L.push('');
 
   // Comp list
   if (compData.usable.length) {
@@ -964,8 +982,14 @@ app.post('/analyze', async (req, res) => {
         nonDisclosureMode = 'zillow-sold';
         console.log(`[nonDisclosure] Using ${zillowComps.length} Zillow-sourced sold comps`);
       } else {
-        // No sold prices anywhere — compute active listing proxy (outlier-filtered)
-        const _rawPpsf  = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
+        // No sold prices anywhere — compute active listing proxy
+        // Step 1: filter to sqft-comparable listings (±40% of subject sqft) so an
+        //         880sf commercial lot doesn't skew the price estimate for a 1,750sf SFR
+        const _sqftMin  = subject.sqft ? subject.sqft * 0.60 : 0;
+        const _sqftMax  = subject.sqft ? subject.sqft * 1.40 : Infinity;
+        const _sqftComp = activeListings.filter(l => l.ppsf && (!l.sqft || (l.sqft >= _sqftMin && l.sqft <= _sqftMax)));
+        const _rawPpsf  = (_sqftComp.length >= 3 ? _sqftComp : activeListings.filter(l => l.ppsf)).map(l => l.ppsf);
+        // Step 2: outlier-filter (±2 SD)
         const _mean     = _rawPpsf.length ? _rawPpsf.reduce((a,b)=>a+b,0)/_rawPpsf.length : 0;
         const _sd       = _rawPpsf.length >= 2
           ? Math.sqrt(_rawPpsf.reduce((s,v)=>s+(v-_mean)**2,0)/_rawPpsf.length) : 0;
@@ -977,7 +1001,7 @@ app.post('/analyze', async (req, res) => {
 
         if (avgActivePpsf) {
           nonDisclosureMode = 'active-proxy';
-          console.log(`[nonDisclosure] Active proxy: $${avgActivePpsf}/sqft from ${_vals.length} listings (${_rawPpsf.length - _vals.length} outliers removed)`);
+          console.log(`[nonDisclosure] Active proxy: $${avgActivePpsf}/sqft | sqft-comparable: ${_sqftComp.length} | after outlier filter: ${_vals.length}`);
         } else {
           nonDisclosureMode = 'no-data';
           console.log(`[nonDisclosure] No sold or active price data found`);
@@ -989,15 +1013,20 @@ app.post('/analyze', async (req, res) => {
     let compData;
     if (nonDisclosureMode === 'active-proxy') {
       // Derive As-Is PPSF from active listings using a 97% sold-to-list ratio (TX typical)
-      // Strip PPSF outliers first (±2 SD) to avoid commercial/multi-unit skewing the avg
-      const rawActivePpsf  = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
+      // Step 1: sqft-comparable listings (±40% of subject sqft)
+      const sqftMin        = subject.sqft ? subject.sqft * 0.60 : 0;
+      const sqftMax        = subject.sqft ? subject.sqft * 1.40 : Infinity;
+      const sqftCompList   = activeListings.filter(l => l.ppsf && (!l.sqft || (l.sqft >= sqftMin && l.sqft <= sqftMax)));
+      const baseList       = sqftCompList.length >= 3 ? sqftCompList : activeListings.filter(l => l.ppsf);
+      // Step 2: outlier-filter (±2 SD)
+      const rawActivePpsf  = baseList.map(l => l.ppsf);
       const ppsfMeanRaw    = rawActivePpsf.reduce((a,b)=>a+b,0) / rawActivePpsf.length;
       const ppsfSd         = Math.sqrt(rawActivePpsf.reduce((s,v)=>s+(v-ppsfMeanRaw)**2,0)/rawActivePpsf.length);
       const activePpsfVals = rawActivePpsf.filter(v => Math.abs(v - ppsfMeanRaw) <= 2 * ppsfSd);
       const usedCount      = activePpsfVals.length || rawActivePpsf.length;
       const avgActivePpsf  = Math.round((activePpsfVals.length ? activePpsfVals : rawActivePpsf).reduce((a,b)=>a+b,0) / usedCount);
       const outlierCount   = rawActivePpsf.length - activePpsfVals.length;
-      if (outlierCount) console.log(`[nonDisclosure] active proxy: removed ${outlierCount} PPSF outlier(s), using ${usedCount} listings`);
+      console.log(`[nonDisclosure] active proxy: sqft-comp=${sqftCompList.length} base=${baseList.length} outliers=${outlierCount} used=${usedCount} avg=$${avgActivePpsf}/sqft`);
       const estPpsf        = Math.round(avgActivePpsf * 0.97);
       const estAsIs        = subject.sqft ? Math.round(estPpsf * subject.sqft / 1000) * 1000 : null;
       const lowPpsf        = activePpsfVals.length ? Math.round(Math.min(...activePpsfVals) * 0.97) : estPpsf;
@@ -1041,8 +1070,8 @@ app.post('/analyze', async (req, res) => {
       }
     }
 
-    // 7. Market pulse
-    const pulse = buildMarketPulse(activeListings, compData.avgPpsf);
+    // 7. Market pulse (pass subject sqft so topByPpsf filters to comparable sizes)
+    const pulse = buildMarketPulse(activeListings, compData.avgPpsf, subject.sqft);
 
     // 8. Novation formula (pure code)
     const asIsValue        = compData.asIsValue;
