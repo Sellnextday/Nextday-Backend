@@ -18,6 +18,13 @@ const ZILLOW_HOST   = 'zillow-real-estate-data-api.p.rapidapi.com';
 let lastDeal = null;
 
 // ══════════════════════════════════════════════════════
+// NON-DISCLOSURE STATES — ATTOM has no sale price data
+// ══════════════════════════════════════════════════════
+const NON_DISCLOSURE_STATES = new Set([
+  'TX','AK','ID','KS','LA','MS','MT','ND','NM','UT','WY','MO','WI','SD'
+]);
+
+// ══════════════════════════════════════════════════════
 // SUBJECT PROPERTY — parsed from your call notes
 // ══════════════════════════════════════════════════════
 
@@ -259,12 +266,66 @@ async function zillowSold(cityState) {
       baths:       p.baths  || null,
       sqft:        p.sqft   || null,
       lat:         p.latitude  || null,
-      lon:         p.longitude || null
+      lon:         p.longitude || null,
+      // Sale price — present in some Zillow API responses (especially non-disclosure states via MLS data)
+      saleAmt:     p.price || p.last_sold_price || p.sold_price || p.last_sale_price || null,
+      saleDate:    p.sold_date || p.last_sold_date || p.date_sold || p.last_sale_date || null,
+      dom:         p.days_on_market || null
     }));
   } catch (err) {
     console.warn('[zillowSold] ERROR:', err.message, err.response?.status, JSON.stringify(err.response?.data||{}).slice(0,200));
     return [];
   }
+}
+
+// ══════════════════════════════════════════════════════
+// NON-DISCLOSURE FALLBACK — convert Zillow sold items
+// (with price) into ATTOM-compatible comp objects
+// ══════════════════════════════════════════════════════
+
+function zillowSoldAsComps(zillowData, subjectLat, subjectLon) {
+  const now     = Date.now();
+  const cutoff  = now - 15 * 30.44 * 24 * 60 * 60 * 1000; // 15 months
+  return zillowData
+    .filter(p => p.saleAmt && p.saleAmt > 50000) // must have a plausible price
+    .map(p => {
+      const saleDate  = p.saleDate ? new Date(p.saleDate) : null;
+      if (saleDate && saleDate.getTime() < cutoff) return null; // too old
+      const monthsOld = saleDate
+        ? (now - saleDate.getTime()) / (1000 * 60 * 60 * 24 * 30.44)
+        : 8; // assume 8mo if no date — conservative, not penalizing or boosting
+      const dist = (subjectLat && subjectLon && p.lat && p.lon)
+        ? Math.round(haversine(subjectLat, subjectLon, p.lat, p.lon) * 100) / 100
+        : null;
+      const fmtSaleDate = p.saleDate
+        ? (p.saleDate.length === 10 ? p.saleDate : new Date(p.saleDate).toISOString().slice(0,10))
+        : null;
+      return {
+        address:      p.address || null,
+        sqft:         p.sqft    || null,
+        beds:         p.beds    || null,
+        baths:        p.baths   || null,
+        halfBaths:    0,
+        garageSpaces: 0,
+        pool:         false,
+        lotSize:      null,
+        yearBuilt:    null,
+        propType:     null,
+        saleAmt:      p.saleAmt,
+        saleDate:     fmtSaleDate,
+        monthsOld:    Math.round(monthsOld * 10) / 10,
+        dom:          p.dom     || null,
+        priorSaleAmt: null,
+        priorSaleDate:null,
+        lat:          p.lat,
+        lon:          p.lon,
+        distanceMi:   dist,
+        zillowEnriched: false,
+        zillowSource:   true  // marks these as Zillow-primary (not ATTOM)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.distanceMi || 99) - (b.distanceMi || 99));
 }
 
 // ══════════════════════════════════════════════════════
@@ -666,7 +727,7 @@ Call notes: ${callNotes||'none'}`;
 }
 
 // ══════════════════════════════════════════════════════
-// SLACK FORMATTER — v3.2
+// SLACK FORMATTER — v3.1
 // ══════════════════════════════════════════════════════
 
 function formatSlack(subject, compData, formulaData, narrative, pulse) {
@@ -678,6 +739,18 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   const specTag = subject.specsSource === 'call notes' ? ' _(your call)_' : '';
   L.push(`${subject.propertyType||'SFR'} · ${subject.sqft?subject.sqft.toLocaleString()+' sqft':'sqft ?'} · ${subject.beds||'?'}bd/${subject.baths||'?'}ba · Built ${subject.yearBuilt||'?'}${specTag}`);
   L.push('');
+
+  // Non-disclosure state warning
+  if (compData.certainty?.label === 'Active proxy only') {
+    L.push(`⚠️ *NON-DISCLOSURE STATE — ESTIMATE ONLY*`);
+    L.push(compData.notes[0] || 'No sale price data available — using active listing proxy.');
+    L.push(`_Numbers below are derived from active listing prices × 0.97. Confirm with your agent before presenting._`);
+    L.push('');
+  } else if (compData.notes?.[0]?.includes('non-disclosure') || compData.notes?.[0]?.includes('Zillow MLS')) {
+    L.push(`⚠️ *NON-DISCLOSURE STATE*`);
+    L.push(compData.notes[0]);
+    L.push('');
+  }
 
   // New construction / vintage mismatch alert
   if (compData.vintageGap >= 25 && subject.yearBuilt) {
@@ -718,7 +791,10 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   }
 
   // Sold comps summary
-  L.push(`📊 *SOLD COMPS* (${compData.usable.length} usable · ${compData.maxRadius}mi · 15mo)`);
+  const compSourceLabel = compData.usable.some(c => c.zillowSource)
+    ? 'Zillow MLS · 15mo'
+    : 'ATTOM County · 15mo';
+  L.push(`📊 *SOLD COMPS* (${compData.usable.length} usable · ${compData.maxRadius}mi · ${compSourceLabel})`);
   if (compData.avgPpsf) {
     L.push(`Avg $${compData.avgPpsf}/sqft · Range $${compData.ppsfRange?.min}–$${compData.ppsfRange?.max}/sqft${compData.avgDom?' · DOM avg '+compData.avgDom:''}`);
   } else {
@@ -732,7 +808,7 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   if (compData.usable.length) {
     L.push(`📋 *COMPS — FULL DATA* (${compData.usable.length})`);
     compData.usable.slice(0,8).forEach((c,i) => {
-      const sourceTag   = c.zillowEnriched ? ' _[County+Zillow]_' : ' _[County]_';
+      const sourceTag   = c.zillowSource ? ' _[Zillow MLS]_' : c.zillowEnriched ? ' _[County+Zillow]_' : ' _[County]_';
       const flipTag     = c.flipComp ? ' ⚡FLIP' : '';
       const outTag      = c.isOutlier ? ` ⚠️(${c.outlierNote?.split(',')[0]})` : '';
       const vintageYrs  = (subject.yearBuilt && c.yearBuilt) ? subject.yearBuilt - c.yearBuilt : 0;
@@ -742,7 +818,7 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
         `${c.distanceMi!=null?c.distanceMi+'mi':''} · ${f(c.saleAmt)} ${c.saleDate} · DOM:${c.dom||'?'} · $${c.adjPpsf}/sf adj${sourceTag}${flipTag}${outTag}${vintageTag}`
       );
     });
-    L.push('_Source: County = ATTOM county records  ·  County+Zillow = county records + Zillow bed/bath enrichment_');
+    L.push('_Source: County = ATTOM county records  ·  County+Zillow = county records + Zillow enrichment  ·  Zillow MLS = non-disclosure state fallback_');
     if (compData.vintageGap >= 25) L.push('_📅 = years older than subject — adjustment applied but value is approximate_');
     L.push('');
   }
@@ -783,9 +859,13 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   if (narrative.risk && narrative.risk !== 'No major flags.')         L.push(`⚠️ ${narrative.risk}`);
   if (narrative.sharpen && narrative.sharpen !== 'Data looks complete.') L.push(`📎 ${narrative.sharpen}`);
 
-  // Flags
+  // Flags (skip the non-disclosure note — already shown as a banner above)
+  const isNdBanner = compData.certainty?.label === 'Active proxy only'
+    || compData.notes?.[0]?.includes('non-disclosure')
+    || compData.notes?.[0]?.includes('Zillow MLS');
+  const flagNotes = (compData.notes||[]).filter((n, i) => !(i === 0 && isNdBanner));
   const flags = [
-    ...(compData.notes||[]),
+    ...flagNotes,
     ...(compData.maxRadius > 5 ? [`Comps spread to ${compData.maxRadius}mi`] : [])
   ];
   if (flags.length) L.push(`\n🚩 ${flags.join(' · ')}`);
@@ -841,6 +921,9 @@ app.post('/analyze', async (req, res) => {
     };
     console.log(`[subject] ${subject.sqft}sf ${subject.beds}bd/${subject.baths}ba ${subject.propertyType} built ${subject.yearBuilt}`);
 
+    const isNonDisclosure = NON_DISCLOSURE_STATES.has(stateCode);
+    if (isNonDisclosure) console.log(`[nonDisclosure] ${stateCode} is a non-disclosure state`);
+
     // 4. ATTOM (1 call) + Zillow sold + Zillow active — all in parallel
     const [compResult, zillowSoldData, activeListings] = await Promise.all([
       pullComps(geo.lat, geo.lon, subject.propertyType, subject.sqft, subject.yearBuilt),
@@ -850,17 +933,94 @@ app.post('/analyze', async (req, res) => {
     console.log(`[data] ATTOM:${compResult.comps.length} ZillowSold:${zillowSoldData.length} Active:${activeListings.length}`);
 
     // 5. Cross-reference: fill in missing beds/baths/sqft from Zillow
-    const enriched = enrichCompsWithZillow(compResult.comps, zillowSoldData);
+    let enriched = enrichCompsWithZillow(compResult.comps, zillowSoldData);
     const enrichCount = enriched.filter(c=>c.zillowEnriched).length;
     if (enrichCount) console.log(`[enrich] ${enrichCount} comps enriched from Zillow`);
 
     // 5b. Enrich new construction comps too
     const newConstrEnriched = enrichCompsWithZillow(compResult.newConstrComps || [], zillowSoldData);
 
-    // 6. Process comps
-    const compData = processComps(enriched, subject, subject.sqft, stateCode);
-    if (compResult.flagged) compData.notes.push('Fewer than 3 usable comps found — treat with caution');
-    compData.newConstrComps = newConstrEnriched; // attach for formatter
+    // ── NON-DISCLOSURE STATE FALLBACK ────────────────────────────────────────
+    // In TX and other non-disclosure states, ATTOM returns properties with zero
+    // sale price. When that happens, attempt two fallbacks in order:
+    //   1. Zillow sold items that do carry a price (MLS-reported or estimate)
+    //   2. Active listing PPSF proxy (list × 0.97 sold-to-list ratio) when
+    //      absolutely no sold price data is available from any source.
+    let nonDisclosureMode = null; // 'zillow-sold' | 'active-proxy' | 'no-data'
+
+    if (isNonDisclosure && compResult.comps.length === 0) {
+      const zillowComps = zillowSoldAsComps(zillowSoldData, geo.lat, geo.lon);
+      console.log(`[nonDisclosure] Zillow sold with prices: ${zillowComps.length}`);
+
+      if (zillowComps.length >= 1) {
+        // Use Zillow sold comps as primary source
+        enriched = zillowComps;
+        nonDisclosureMode = 'zillow-sold';
+        console.log(`[nonDisclosure] Using ${zillowComps.length} Zillow-sourced sold comps`);
+      } else {
+        // No sold prices anywhere — compute active listing proxy
+        const activePpsfVals = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
+        const avgActivePpsf  = activePpsfVals.length
+          ? Math.round(activePpsfVals.reduce((a,b)=>a+b,0)/activePpsfVals.length)
+          : null;
+
+        if (avgActivePpsf) {
+          nonDisclosureMode = 'active-proxy';
+          console.log(`[nonDisclosure] Active proxy: $${avgActivePpsf}/sqft from ${activePpsfVals.length} listings`);
+        } else {
+          nonDisclosureMode = 'no-data';
+          console.log(`[nonDisclosure] No sold or active price data found`);
+        }
+      }
+    }
+
+    // 6. Process comps (or synthesize from active-listing proxy)
+    let compData;
+    if (nonDisclosureMode === 'active-proxy') {
+      // Derive As-Is PPSF from active listings using a 97% sold-to-list ratio (TX typical)
+      const activePpsfVals = activeListings.filter(l => l.ppsf).map(l => l.ppsf);
+      const avgActivePpsf  = Math.round(activePpsfVals.reduce((a,b)=>a+b,0)/activePpsfVals.length);
+      const estPpsf        = Math.round(avgActivePpsf * 0.97);
+      const estAsIs        = subject.sqft ? Math.round(estPpsf * subject.sqft / 1000) * 1000 : null;
+      const lowPpsf        = activePpsfVals.length ? Math.round(Math.min(...activePpsfVals) * 0.97) : estPpsf;
+      const highPpsf       = activePpsfVals.length ? Math.round(Math.max(...activePpsfVals) * 0.97) : estPpsf;
+
+      compData = {
+        usable: [], incomplete: [],
+        asIsValue:   estAsIs,
+        avgPpsf:     estPpsf,
+        ppsfRange:   { min: lowPpsf, max: highPpsf },
+        certainty:   { score: 20, label: 'Active proxy only' },
+        maxRadius:   2,
+        avgDom:      null,
+        flips: 0, outliers: 0,
+        notes: [
+          `⚠️ ${stateCode} non-disclosure — ATTOM has no sale data, no Zillow sold prices found. ` +
+          `As-Is estimate derived from ${activePpsfVals.length} active listings (list × 0.97). ` +
+          `VERIFY WITH AGENT before presenting offer.`
+        ],
+        newConstrComps:  [],
+        vintageGap:      0,
+        avgCompVintage:  null
+      };
+    } else {
+      compData = processComps(enriched, subject, subject.sqft, stateCode);
+      if (compResult.flagged && nonDisclosureMode !== 'zillow-sold') {
+        compData.notes.push('Fewer than 3 usable comps found — treat with caution');
+      }
+      compData.newConstrComps = newConstrEnriched;
+
+      if (nonDisclosureMode === 'zillow-sold') {
+        compData.notes.unshift(
+          `⚠️ ${stateCode} non-disclosure state — ATTOM has no sale data. ` +
+          `Using ${enriched.length} Zillow MLS-reported sold comps instead.`
+        );
+      } else if (nonDisclosureMode === 'no-data') {
+        compData.notes.push(
+          `⚠️ ${stateCode} non-disclosure state — no sale prices found in ATTOM or Zillow`
+        );
+      }
+    }
 
     // 7. Market pulse
     const pulse = buildMarketPulse(activeListings, compData.avgPpsf);
@@ -870,7 +1030,7 @@ app.post('/analyze', async (req, res) => {
     const novationMao      = asIsValue ? Math.round(asIsValue * 0.93 - 50000) : null;
     const novationListPrice = asIsValue;
     const formulaData      = { asIsValue, novationMao, novationListPrice };
-    console.log(`[formula] AsIs:${asIsValue} MAO:${novationMao}`);
+    console.log(`[formula] AsIs:${asIsValue} MAO:${novationMao} nonDisclosureMode:${nonDisclosureMode||'none'}`);
 
     // 9. Narrative (1 Anthropic call)
     const narrative = await narrativeAgent(subject, compData, formulaData, pulse, callNotes);
@@ -943,11 +1103,11 @@ app.get('/last-deal', (req, res) => {
 
 app.get('/health', (req, res) =>
   res.json({
-    status: 'ok', version: '3.2',
+    status: 'ok', version: '3.3',
     attom: !!ATTOM_KEY, zillow: !!RAPIDAPI_KEY, anthropic: !!ANTHROPIC_KEY,
     lastDeal: lastDeal ? { address: lastDeal.address, analyzedAt: lastDeal.analyzedAt } : null
   })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Deal Analyzer v3.2 (ATTOM + Zillow + deal memory) on :${PORT}`));
+app.listen(PORT, () => console.log(`Deal Analyzer v3.3 (ATTOM + Zillow + non-disclosure fallback + deal memory) on :${PORT}`));
