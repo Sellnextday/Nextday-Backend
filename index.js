@@ -360,12 +360,13 @@ async function zillowActiveListings(lat, lon, radiusMiles = 2) {
     if (!allItems.length) console.log('[zillowActive] raw response:', JSON.stringify(res.data).slice(0, 400));
     return forSale.map(p => ({
       address:   p.address || '',
-      beds:      p.beds   || null,
-      baths:     p.baths  || null,
-      sqft:      p.sqft   || null,
+      beds:      p.beds    || null,
+      baths:     p.baths   || null,
+      sqft:      p.sqft    || null,
       listPrice: p.list_price_usd || null,
       dom:       p.days_on_market ?? null,
       propType:  p.property_type  || null,
+      yearBuilt: p.year_built || p.yearBuilt || p.built_year || null,
       ppsf:      (p.list_price_usd && p.sqft) ? Math.round(p.list_price_usd / p.sqft) : null
     }));
   } catch (err) {
@@ -433,7 +434,7 @@ function enrichCompsWithZillow(attomComps, zillowData) {
 // ACTIVE MARKET PULSE
 // ══════════════════════════════════════════════════════
 
-function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null) {
+function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null, subjectYearBuilt = null) {
   if (!listings.length) return null;
   const withPpsf    = listings.filter(l => l.ppsf);
   const avgListPpsf = withPpsf.length ? Math.round(withPpsf.reduce((s,l)=>s+l.ppsf,0)/withPpsf.length) : null;
@@ -441,26 +442,62 @@ function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null) {
   const avgDom      = withDom.length ? Math.round(withDom.reduce((s,l)=>s+l.dom,0)/withDom.length) : null;
   const flipListings = avgSoldPpsf ? listings.filter(l => l.ppsf && l.ppsf >= avgSoldPpsf * 1.15) : [];
 
-  // Top active listings by $/sqft — filter to sqft-comparable listings (±35% of subject)
-  // Tight enough to exclude 880sf commercial listings and 3,000sf+ outliers from a 1,750sf SFR pool
+  // Identify new builds:
+  //   - year_built captured from API AND built within last 8 years (or 15+ years newer than subject)
+  //   - OR no year_built but $/sqft > 1.4× the group median (price premium = likely renovated/new)
+  const currentYear = new Date().getFullYear();
+  const newBuildYearCutoff = subjectYearBuilt
+    ? Math.max(subjectYearBuilt + 15, currentYear - 8)  // 15yr newer than subject OR last 8 years
+    : currentYear - 8;
+  const ppsfMedian = withPpsf.length ? [...withPpsf].sort((a,b)=>a.ppsf-b.ppsf)[Math.floor(withPpsf.length/2)].ppsf : null;
+  const isNewBuild = l =>
+    (l.yearBuilt && l.yearBuilt >= newBuildYearCutoff) ||
+    (!l.yearBuilt && ppsfMedian && l.ppsf && l.ppsf >= ppsfMedian * 1.40);
+
+  // Stale listing: on market 150+ days = seller is overpriced, price will slide
+  const isStale = l => l.dom != null && l.dom >= 150;
+
+  // Display-comparable: ±45% of subject sqft (looser than proxy calc so smaller same-era homes show)
+  // This includes a 1,000sf house near a 1,750sf subject but still excludes 880sf commercial lots
   const comparable = subjectSqft
-    ? withPpsf.filter(l => !l.sqft || (l.sqft >= subjectSqft * 0.65 && l.sqft <= subjectSqft * 1.35))
+    ? withPpsf.filter(l => !l.sqft || (l.sqft >= subjectSqft * 0.55 && l.sqft <= subjectSqft * 1.45))
     : withPpsf;
-  const topPool = comparable.length >= 3 ? comparable : withPpsf; // fall back to all if too few
-  const topByPpsf = [...topPool]
+  const compPool = comparable.length >= 3 ? comparable : withPpsf;
+
+  // Split: new builds go to their own section; everything else = standard comps
+  const standardComps  = compPool.filter(l => !isNewBuild(l));
+  const newBuildComps  = compPool.filter(l =>  isNewBuild(l));
+
+  // Top standard comparable listings (exclude new builds so they don't inflate the ceiling)
+  const topByPpsf = [...standardComps]
     .sort((a, b) => b.ppsf - a.ppsf)
     .slice(0, 5)
-    .map(l => ({ address: l.address, sqft: l.sqft, listPrice: l.listPrice, ppsf: l.ppsf, dom: l.dom }));
+    .map(l => ({
+      address:   l.address,
+      sqft:      l.sqft,
+      listPrice: l.listPrice,
+      ppsf:      l.ppsf,
+      dom:       l.dom,
+      yearBuilt: l.yearBuilt,
+      stale:     isStale(l)    // flag for display: DOM 150+ = overpriced, will come down
+    }));
+
+  // Top new build listings (separate ceiling section)
+  const newBuildListings = [...newBuildComps]
+    .sort((a, b) => b.ppsf - a.ppsf)
+    .slice(0, 3)
+    .map(l => ({ address: l.address, sqft: l.sqft, listPrice: l.listPrice, ppsf: l.ppsf, dom: l.dom, yearBuilt: l.yearBuilt }));
 
   return {
     count: listings.length,
     avgListPpsf,
     avgDom,
-    flipListings: flipListings.length,
-    highPpsf:    withPpsf.length ? Math.max(...withPpsf.map(l=>l.ppsf)) : null,
-    lowPpsf:     withPpsf.length ? Math.min(...withPpsf.map(l=>l.ppsf)) : null,
+    flipListings:    flipListings.length,
+    highPpsf:        withPpsf.length ? Math.max(...withPpsf.map(l=>l.ppsf)) : null,
+    lowPpsf:         withPpsf.length ? Math.min(...withPpsf.map(l=>l.ppsf)) : null,
     topByPpsf,
-    comparableCount: comparable.length
+    newBuildListings,
+    comparableCount: compPool.length
   };
 }
 
@@ -785,16 +822,26 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push(`🏠 *ACTIVE MARKET* (${pulse.count} listings · 2mi)`);
     L.push(`Avg list $${pulse.avgListPpsf||'?'}/sqft · DOM ${pulse.avgDom??'?'}${flipNote}`);
 
-    // Top listings by $/sqft — filtered to sqft-comparable properties (±50% of subject)
+    // Standard comparable listings (same era, sqft-comparable, non-stale)
     if (pulse.topByPpsf?.length) {
-      const compLabel = pulse.comparableCount != null
-        ? ` · ${pulse.comparableCount} sqft-comparable`
-        : '';
-      L.push(`📈 *Top comparable active listings (size-filtered ceiling):*${compLabel}`);
+      L.push(`📈 *Comparable active listings:*`);
       pulse.topByPpsf.forEach((l, i) => {
-        const addr = l.address ? l.address.split(',')[0] : '—';
-        L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'} · ${f(l.listPrice)} · $${l.ppsf}/sqft${l.dom!=null?' · DOM '+l.dom:''}`);
+        const addr     = l.address ? l.address.split(',')[0] : '—';
+        const staleTag = l.stale ? ' ⚠️ 150+ DOM — price likely dropping' : '';
+        const yrTag    = l.yearBuilt ? ` built ${l.yearBuilt}` : '';
+        L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'}${yrTag} · ${f(l.listPrice)} · $${l.ppsf}/sqft · DOM ${l.dom??'?'}${staleTag}`);
       });
+    }
+
+    // New builds in the area — shown separately as a ceiling, NOT used in price estimate
+    if (pulse.newBuildListings?.length) {
+      L.push(`🏗️ *New builds in area* _(ceiling only — not used in As-Is estimate for older homes)_`);
+      pulse.newBuildListings.forEach((l, i) => {
+        const addr  = l.address ? l.address.split(',')[0] : '—';
+        const yrTag = l.yearBuilt ? ` built ${l.yearBuilt}` : '';
+        L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'}${yrTag} · ${f(l.listPrice)} · $${l.ppsf}/sqft · DOM ${l.dom??'?'}`);
+      });
+      L.push(`  _These are listed at new-construction prices — comparable as ceiling, not baseline_`);
     }
     L.push('');
   }
@@ -983,11 +1030,17 @@ app.post('/analyze', async (req, res) => {
         console.log(`[nonDisclosure] Using ${zillowComps.length} Zillow-sourced sold comps`);
       } else {
         // No sold prices anywhere — compute active listing proxy
-        // Step 1: filter to sqft-comparable listings (±35% of subject sqft) so an
-        //         880sf commercial lot doesn't skew the price estimate for a 1,750sf SFR
+        // Step 1: sqft-comparable (±35%), non-stale (DOM < 150), exclude new builds
         const _sqftMin  = subject.sqft ? subject.sqft * 0.65 : 0;
         const _sqftMax  = subject.sqft ? subject.sqft * 1.35 : Infinity;
-        const _sqftComp = activeListings.filter(l => l.ppsf && (!l.sqft || (l.sqft >= _sqftMin && l.sqft <= _sqftMax)));
+        const _curYear  = new Date().getFullYear();
+        const _nbCutoff = subject.yearBuilt ? Math.max(subject.yearBuilt + 15, _curYear - 8) : _curYear - 8;
+        const _sqftComp = activeListings.filter(l =>
+          l.ppsf &&
+          (!l.sqft || (l.sqft >= _sqftMin && l.sqft <= _sqftMax)) && // sqft-comparable
+          (l.dom == null || l.dom < 150) &&                           // not stale
+          (!l.yearBuilt || l.yearBuilt < _nbCutoff)                  // not new build
+        );
         const _rawPpsf  = (_sqftComp.length >= 3 ? _sqftComp : activeListings.filter(l => l.ppsf)).map(l => l.ppsf);
         // Step 2: outlier-filter (±2 SD)
         const _mean     = _rawPpsf.length ? _rawPpsf.reduce((a,b)=>a+b,0)/_rawPpsf.length : 0;
@@ -1013,11 +1066,18 @@ app.post('/analyze', async (req, res) => {
     let compData;
     if (nonDisclosureMode === 'active-proxy') {
       // Derive As-Is PPSF from active listings using a 97% sold-to-list ratio (TX typical)
-      // Step 1: sqft-comparable listings (±35% of subject sqft)
+      // Step 1: sqft-comparable (±35%), non-stale (DOM < 150), exclude new builds
       const sqftMin        = subject.sqft ? subject.sqft * 0.65 : 0;
       const sqftMax        = subject.sqft ? subject.sqft * 1.35 : Infinity;
-      const sqftCompList   = activeListings.filter(l => l.ppsf && (!l.sqft || (l.sqft >= sqftMin && l.sqft <= sqftMax)));
-      const baseList       = sqftCompList.length >= 3 ? sqftCompList : activeListings.filter(l => l.ppsf);
+      const curYear        = new Date().getFullYear();
+      const nbYearCutoff   = subject.yearBuilt ? Math.max(subject.yearBuilt + 15, curYear - 8) : curYear - 8;
+      const sqftCompList   = activeListings.filter(l =>
+        l.ppsf &&
+        (!l.sqft || (l.sqft >= sqftMin && l.sqft <= sqftMax)) &&
+        (l.dom == null || l.dom < 150) &&
+        (!l.yearBuilt || l.yearBuilt < nbYearCutoff)
+      );
+      const baseList       = sqftCompList.length >= 3 ? sqftCompList : activeListings.filter(l => l.ppsf && (l.dom == null || l.dom < 150));
       // Step 2: outlier-filter (±2 SD)
       const rawActivePpsf  = baseList.map(l => l.ppsf);
       const ppsfMeanRaw    = rawActivePpsf.reduce((a,b)=>a+b,0) / rawActivePpsf.length;
@@ -1070,8 +1130,8 @@ app.post('/analyze', async (req, res) => {
       }
     }
 
-    // 7. Market pulse (pass subject sqft so topByPpsf filters to comparable sizes)
-    const pulse = buildMarketPulse(activeListings, compData.avgPpsf, subject.sqft);
+    // 7. Market pulse (pass subject sqft + yearBuilt so topByPpsf filters correctly)
+    const pulse = buildMarketPulse(activeListings, compData.avgPpsf, subject.sqft, subject.yearBuilt);
 
     // 8. Novation formula (pure code)
     const asIsValue        = compData.asIsValue;
