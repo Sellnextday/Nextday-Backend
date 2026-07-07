@@ -371,7 +371,7 @@ async function zillowActiveListings(lat, lon, radiusMiles = 2) {
     console.log(`[zillowActive] HTTP ${res.status} → ${allItems.length} total, ${forSale.length} FOR_SALE | bounds: ${JSON.stringify(bounds)}`);
     if (!allItems.length) console.log('[zillowActive] raw response:', JSON.stringify(res.data).slice(0, 400));
     return forSale.map(p => ({
-    2 address:   p.address || '',
+      address:   p.address || '',
       beds:      p.beds    || null,
       baths:     p.baths   || null,
       sqft:      p.sqft    || null,
@@ -580,7 +580,7 @@ function propAdj(comp, subject, stateCode) {
     const gapYrs = subject.yearBuilt - comp.yearBuilt;
     const absGap = Math.abs(gapYrs);
     let yrAdj = 0;
-    if (absGap <= 10)      yrAdj = absGap * 500;                                     // $500/yr
+    if (absGap <= 10)       yrAdj = absGap * 500;                                     // $500yr
     else if (absGap <= 20) yrAdj = 5000  + (absGap - 10) * 1000;                    // $1,000/yr
     else if (absGap <= 30) yrAdj = 15000 + (absGap - 20) * 2000;                    // $2,000/yr
     else                   yrAdj = 35000 + (absGap - 30) * 3000;                    // $3,000/yr
@@ -866,7 +866,7 @@ async function assessConditionFromPhotos(listings) {
 // ══════════════════════════════════════════════════════
 // DAMAGE / CONDITION EXTRACTION — parses call notes for
 // damage signals and repair cost estimates
-// ══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════
 
 function extractConditionNotes(callNotes) {
   if (!callNotes) return { hasDamage: false, damageTypes: [], estRepairCost: null };
@@ -879,7 +879,7 @@ function extractConditionNotes(callNotes) {
     damageTypes.push('fire damage');
   if (/foundation|structural|sinking|settling|crack\s*in\s*(?:the\s*)?(?:found|wall|slab)/i.test(callNotes))
     damageTypes.push('foundation issues');
-  if (/(?:needs?\s*(?:new\s*)?|old\s*|bad\s*|leaking?\s*)roof|roof\s*(?:damage|replace|rge|replace|repair|issue|bad|old)/i.test(callNotes))
+  if (/(?:needs?\s*(?:new\s*)?|old\s*|bad\s*|leaking?\s*)roof|roof\s*(?:damage|replace|repair|issue|bad|old)/i.test(callNotes))
     damageTypes.push('roof issues');
   if (/mold|mildew/i.test(callNotes))
     damageTypes.push('mold');
@@ -946,13 +946,12 @@ async function narrativeAgent(subject, compData, formulaData, pulse, callNotes) 
   const userMsg =
 `Property: ${subject.address} | ${subject.sqft||'?'}sqft | ${subject.beds||'?'}bd/${subject.baths||'?'}ba | Built ${subject.yearBuilt||'?'} | ${subject.propertyType||'SFR'} | specs from ${subject.specsSource}
 Usable comps: ${compData.usable.length} (full data) + ${compData.incomplete.length} incomplete (no sqft)
-Radius: ${compData.maxRadius}mi · Avg $${compData.avgPpsf||'?'}/sqft · Range $${compData.ppsfRange?.min}–$${compData.ppsfRange?.max}/sqft · Avg DOM ${compData.avgDom||'?'}
+Radius: ${compData.maxRadius}mi · Avg $${compData.avgPpsf||'?'}/sqft · Range $${compData.ppsfRange?.min||'?'}–$${compData.ppsfRange?.max||'?'}/sqft · Avg DOM ${compData.avgDom||'?'}
 ${pulseText}
 ${ncText}
 
 Comps:
 ${compLines || 'None with full data'}
-,l data'}
 
 As-Is Market Value: $${formulaData.asIsValue?.toLocaleString()||'N/A'}
 Novation MAO: $${formulaData.novationMao?.toLocaleString()||'N/A'}
