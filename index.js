@@ -202,7 +202,8 @@ async function attomSaleComps(lat, lon, radiusMiles) {
 
   return (res.data?.property || [])
     .filter(p => {
-      if (!p.sale?.amount?.saleamt || parseFloat(p.sale.amount.saleamt) <= 0) return false;
+      const amt = parseFloat(p.sale?.amount?.saleamt);
+      if (!amt || amt <= 0) return false; // data sanity only — real distress filtering is IQR-based in processComps
       const sd = p.sale?.saleTransDate || p.sale?.salesearchdate;
       return sd && new Date(sd) >= cutoff;
     })
@@ -370,7 +371,7 @@ async function zillowActiveListings(lat, lon, radiusMiles = 2) {
     console.log(`[zillowActive] HTTP ${res.status} → ${allItems.length} total, ${forSale.length} FOR_SALE | bounds: ${JSON.stringify(bounds)}`);
     if (!allItems.length) console.log('[zillowActive] raw response:', JSON.stringify(res.data).slice(0, 400));
     return forSale.map(p => ({
-      address:   p.address || '',
+    2 address:   p.address || '',
       beds:      p.beds    || null,
       baths:     p.baths   || null,
       sqft:      p.sqft    || null,
@@ -484,8 +485,9 @@ function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null, subjectYear
     (l.yearBuilt && l.yearBuilt >= newBuildYearCutoff) ||
     (!l.yearBuilt && ppsfMedian && l.ppsf && l.ppsf >= ppsfMedian * 1.40);
 
-  // Stale listing: on market 150+ days = seller is overpriced, price will slide
-  const isStale = l => l.dom != null && l.dom >= 150;
+  // Stale listing: 90+ days = seller is overpriced, price will slide
+  // Realistic price at 90% of list — what it would need to drop to to move
+  const isStale = l => l.dom != null && l.dom >= 90;
 
   // Display-comparable: ±45% of subject sqft (looser than proxy calc so smaller same-era homes show)
   // This includes a 1,000sf house near a 1,750sf subject but still excludes 880sf commercial lots
@@ -503,16 +505,17 @@ function buildMarketPulse(listings, avgSoldPpsf, subjectSqft = null, subjectYear
     .sort((a, b) => b.ppsf - a.ppsf)
     .slice(0, 5)
     .map(l => ({
-      address:       l.address,
-      sqft:          l.sqft,
-      listPrice:     l.listPrice,
-      ppsf:          l.ppsf,
-      dom:           l.dom,
-      yearBuilt:     l.yearBuilt,
-      stale:         isStale(l),      // flag for display: DOM 150+ = overpriced, will come down
-      condition:     l.condition     || null,   // 'Updated' | 'Partial' | 'Dated' — from photo AI
-      conditionNote: l.conditionNote || null,   // e.g. "granite counters, LVP floors"
-      zillowUrl:     l.zillowUrl     || null
+      address:        l.address,
+      sqft:           l.sqft,
+      listPrice:      l.listPrice,
+      ppsf:           l.ppsf,
+      dom:            l.dom,
+      yearBuilt:      l.yearBuilt,
+      stale:          isStale(l),
+      realisticPrice: isStale(l) && l.listPrice ? Math.round(l.listPrice * 0.90 / 1000) * 1000 : null,
+      condition:      l.condition     || null,
+      conditionNote:  l.conditionNote || null,
+      zillowUrl:      l.zillowUrl     || null
     }));
 
   // Top new build listings (separate ceiling section)
@@ -571,14 +574,16 @@ function propAdj(comp, subject, stateCode) {
     const r = comp.lotSize / subject.lotSize;
     if (r > 2 || r < 0.5) adj += (subject.lotSize - comp.lotSize) * 43560 * 1.5;
   }
-  // Year-built adjustment — tiered scaling for large vintage gaps
+  // Year-built adjustment — tiered scaling, stronger for large vintage gaps
+  // A 1976 home vs 2000-built comps needs a meaningful discount (~$23K), not $1,600
   if (subject.yearBuilt && comp.yearBuilt) {
     const gapYrs = subject.yearBuilt - comp.yearBuilt;
     const absGap = Math.abs(gapYrs);
     let yrAdj = 0;
-    if (absGap <= 20)      yrAdj = absGap / 10 * 500;
-    else if (absGap <= 40) yrAdj = 20/10*500 + (absGap-20)/10 * 1500;
-    else                   yrAdj = 20/10*500 + 20/10*1500 + (absGap-40)/10 * 3000;
+    if (absGap <= 10)      yrAdj = absGap * 500;                                     // $500/yr
+    else if (absGap <= 20) yrAdj = 5000  + (absGap - 10) * 1000;                    // $1,000/yr
+    else if (absGap <= 30) yrAdj = 15000 + (absGap - 20) * 2000;                    // $2,000/yr
+    else                   yrAdj = 35000 + (absGap - 30) * 3000;                    // $3,000/yr
     adj += Math.sign(gapYrs) * yrAdj;
   }
   return Math.round(Math.max(-comp.saleAmt*0.30, Math.min(comp.saleAmt*0.30, adj)));
@@ -647,12 +652,58 @@ function certaintyScore(coreComps, subject, maxRadius) {
 
 function processComps(rawComps, subject, sqft, stateCode) {
   const BUF = 500;
-  const usableRaw    = rawComps.filter(c => c.sqft && (!sqft || (c.sqft >= sqft-BUF && c.sqft <= sqft+BUF)));
+
+  // Sqft filter
+  const sqftFiltered  = rawComps.filter(c => c.sqft && (!sqft || (c.sqft >= sqft-BUF && c.sqft <= sqft+BUF)));
   const incompleteRaw = rawComps.filter(c => !c.sqft);
+
+  // Area-calibrated distress pre-filter using median $/sqft.
+  // All comps at this stage have sqft (required by sqftFiltered), so we can compute
+  // raw $/sqft for every comp. Remove anything below 30% of the local median $/sqft.
+  // This is NO hard floor — it scales with the local market automatically:
+  //   Birmingham $90/sqft median → fence $27/sqft → catches $2.50 deed transfer ✅
+  //   Rural $55/sqft market     → fence $16.50/sqft → keeps $40K legit cheap sale ✅
+  //   $200K suburb $130/sqft    → fence $39/sqft → catches $3K and $12K distress ✅
+  const rawPpsfVals = sqftFiltered
+    .filter(c => c.saleAmt && c.sqft)
+    .map(c => c.saleAmt / c.sqft)
+    .sort((a, b) => a - b);
+  let sanityChecked = sqftFiltered;
+  if (rawPpsfVals.length >= 2) {
+    const mid        = Math.floor(rawPpsfVals.length / 2);
+    const medianPpsf = rawPpsfVals.length % 2 !== 0
+      ? rawPpsfVals[mid]
+      : (rawPpsfVals[mid - 1] + rawPpsfVals[mid]) / 2;
+    const ppsfFence  = medianPpsf * 0.30;  // 30% of median = area-calibrated distress floor
+    sanityChecked = sqftFiltered.filter(c => {
+      if (!c.saleAmt || !c.sqft) return true; // no price — keep, handled as incomplete later
+      return (c.saleAmt / c.sqft) >= ppsfFence;
+    });
+    const distressRemoved = sqftFiltered.length - sanityChecked.length;
+    if (distressRemoved > 0) {
+      console.log(`[processComps] $/sqft pre-filter removed ${distressRemoved} distress comp(s) below $${Math.round(ppsfFence)}/sqft (30% of local median $${Math.round(medianPpsf)}/sqft)`);
+    }
+  }
+
+  // Era-gap split: for aged subjects (≤ 1990), comps 25+ yr NEWER are modern-market,
+  // not true comparables. Separate them so they don't inflate the avg ppsf.
+  let usableRaw  = sanityChecked;
+  let modernPool = [];
+  if (subject.yearBuilt && subject.yearBuilt <= 1990) {
+    const modern  = sanityChecked.filter(c => c.yearBuilt && (c.yearBuilt - subject.yearBuilt) > 25);
+    const sameEra = sanityChecked.filter(c => !c.yearBuilt || (c.yearBuilt - subject.yearBuilt) <= 25);
+    if (sameEra.length >= 2) {
+      usableRaw  = sameEra;
+      modernPool = modern;
+      console.log(`[processComps] era-gap: ${modern.length} modern comp(s) removed from avg (25yr+ newer), using ${sameEra.length} same-era comp(s)`);
+    } else {
+      console.log(`[processComps] era-gap: only ${sameEra.length} same-era comp(s) found — using all ${sanityChecked.length} comps (vintage adj applied)`);
+    }
+  }
 
   if (!usableRaw.length) {
     const maxR = rawComps.length ? Math.max(...rawComps.map(c=>c.distanceMi||0)) : 0;
-    return { usable: [], incomplete: incompleteRaw, asIsValue: null, avgPpsf: null,
+    return { usable: [], incomplete: incompleteRaw, modernPool, asIsValue: null, avgPpsf: null,
              ppsfRange: null, certainty: { score: 0, label: 'No usable comps' },
              maxRadius: maxR, avgDom: null, flips: 0, outliers: 0, notes: [] };
   }
@@ -703,7 +754,16 @@ function processComps(rawComps, subject, sqft, stateCode) {
   if (incompleteRaw.length)  notes.push(`${incompleteRaw.length} comp${incompleteRaw.length>1?'s':''} missing sqft — excluded`);
   if (vintageGap >= 25)      notes.push(`⚠️ Vintage gap ${vintageGap}yr — comps avg ${avgCompVintage}, subject built ${subject.yearBuilt}. Value likely understated.`);
 
-  return { usable: tagged, incomplete: incompleteRaw, asIsValue, avgPpsf, ppsfRange,
+  // Process modern-era comps separately (for display as ceiling reference)
+  const modernPoolProcessed = modernPool.map(c => {
+    const tAdj   = timeAdj(c.saleAmt, c.monthsOld);
+    const pAdj   = propAdj(c, subject, stateCode);
+    const adjAmt = tAdj + pAdj;
+    return { ...c, propAdj: pAdj, adjAmt: Math.round(adjAmt),
+             adjPpsf: c.sqft ? Math.round(adjAmt / c.sqft) : null, flipComp: isFlip(c) };
+  });
+
+  return { usable: tagged, incomplete: incompleteRaw, modernPool: modernPoolProcessed, asIsValue, avgPpsf, ppsfRange,
            certainty: cert, maxRadius, avgDom, flips: flipCount, outliers: outCount,
            notes, avgCompVintage, vintageGap };
 }
@@ -804,6 +864,59 @@ async function assessConditionFromPhotos(listings) {
 }
 
 // ══════════════════════════════════════════════════════
+// DAMAGE / CONDITION EXTRACTION — parses call notes for
+// damage signals and repair cost estimates
+// ══════════════════════════════════════════════════
+
+function extractConditionNotes(callNotes) {
+  if (!callNotes) return { hasDamage: false, damageTypes: [], estRepairCost: null };
+
+  const damageTypes = [];
+
+  if (/water\s*damage|flooded?|flood\s*damage|wet\s*basement|moisture|seep/i.test(callNotes))
+    damageTypes.push('water damage');
+  if (/fire\s*damage|burnt?\s*(?:out|down)?|burned|smoke\s*damage/i.test(callNotes))
+    damageTypes.push('fire damage');
+  if (/foundation|structural|sinking|settling|crack\s*in\s*(?:the\s*)?(?:found|wall|slab)/i.test(callNotes))
+    damageTypes.push('foundation issues');
+  if (/(?:needs?\s*(?:new\s*)?|old\s*|bad\s*|leaking?\s*)roof|roof\s*(?:damage|replace|rge|replace|repair|issue|bad|old)/i.test(callNotes))
+    damageTypes.push('roof issues');
+  if (/mold|mildew/i.test(callNotes))
+    damageTypes.push('mold');
+  if (/busted?\s*pipes?|broken\s*pipes?|pipes?\s*burst|no\s*(?:running\s*)?water|plumbing\s*(?:issue|problem|damage)/i.test(callNotes))
+    damageTypes.push('plumbing / pipes');
+  if (/\bhvac\b|(?:no|broken?|bad)\s*(?:heat|a\/c|ac|air\s*cond)|furnace\s*(?:out|broken|bad|dead)/i.test(callNotes))
+    damageTypes.push('HVAC');
+  if (/electrical|wiring|(?:no|bad)\s*power|meter\s*pull|\bpanel\b/i.test(callNotes))
+    damageTypes.push('electrical');
+  if (/hoard|trash\s*(?:out|inside)|full\s*of\s*(?:trash|junk|stuff)|cleanout/i.test(callNotes))
+    damageTypes.push('cleanout needed');
+
+  // Extract repair cost: "$40k repair", "needs $40,000 work", "estimate 40k", etc.
+  const repairPatterns = [
+    /\$([\d,]+)\s*k\+?\s*(?:repair|rehab|work|fix|reno(?:vation)?|estimate|clean)/i,
+    /\$([\d,]+)\s*(?:,000)?\s*(?:repair|rehab|work|fix|reno(?:vation)?|estimate|clean)/i,
+    /needs?\s*(?:about|around|approx(?:imately)?)?\s*\$([\d,]+)\s*k/i,
+    /(?:repair|rehab|work|estimate)s?\s*(?:is|are|of|about|around)?\s*\$([\d,]+)\s*k/i,
+    /\b([\d,]+)\s*k\s*(?:repair|rehab|work|fix|reno(?:vation)?|estimate|in\s*work)/i
+  ];
+  let estRepairCost = null;
+  for (const pat of repairPatterns) {
+    const m = callNotes.match(pat);
+    if (m) {
+      const raw    = parseFloat(m[1].replace(/,/g, ''));
+      const matchStr = m[0].toLowerCase();
+      // Determine if the number is already in thousands or needs k-multiplier
+      const hasK   = /\dk\b/.test(matchStr) || /k\+?/.test(matchStr.replace(/[^k]/g,'k').slice(0,5));
+      estRepairCost = (hasK || raw < 500) ? raw * 1000 : raw;
+      break;
+    }
+  }
+
+  return { hasDamage: damageTypes.length > 0, damageTypes, estRepairCost };
+}
+
+// ══════════════════════════════════════════════════════
 // NARRATIVE AGENT
 // ══════════════════════════════════════════════════════
 
@@ -833,12 +946,13 @@ async function narrativeAgent(subject, compData, formulaData, pulse, callNotes) 
   const userMsg =
 `Property: ${subject.address} | ${subject.sqft||'?'}sqft | ${subject.beds||'?'}bd/${subject.baths||'?'}ba | Built ${subject.yearBuilt||'?'} | ${subject.propertyType||'SFR'} | specs from ${subject.specsSource}
 Usable comps: ${compData.usable.length} (full data) + ${compData.incomplete.length} incomplete (no sqft)
-Radius: ${compData.maxRadius}mi · Avg $${compData.avgPpsf||'?'}/sqft · Range $${compData.ppsfRange?.min||'?'}–$${compData.ppsfRange?.max||'?'}/sqft · Avg DOM ${compData.avgDom||'?'}
+Radius: ${compData.maxRadius}mi · Avg $${compData.avgPpsf||'?'}/sqft · Range $${compData.ppsfRange?.min}–$${compData.ppsfRange?.max}/sqft · Avg DOM ${compData.avgDom||'?'}
 ${pulseText}
 ${ncText}
 
 Comps:
 ${compLines || 'None with full data'}
+,l data'}
 
 As-Is Market Value: $${formulaData.asIsValue?.toLocaleString()||'N/A'}
 Novation MAO: $${formulaData.novationMao?.toLocaleString()||'N/A'}
@@ -886,6 +1000,14 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push('');
   }
 
+  // Multi-family / duplex warning — SFR comps don't reflect income value
+  if (subject.propertyType === 'MULTI_FAMILY') {
+    L.push(`🚨 *DUPLEX / MULTI-FAMILY — COMPS ARE SFR*`);
+    L.push(`SFR sold comps were used because no multi-family comps were found nearby. Value is likely overstated.`);
+    L.push(`_Multi-family pricing uses income approach (monthly rent × GRM). Verify with your agent before presenting any offer._`);
+    L.push('');
+  }
+
   // New construction / vintage mismatch alert
   if (compData.vintageGap >= 25 && subject.yearBuilt) {
     L.push(`🚨 *NEW CONSTRUCTION ALERT*`);
@@ -907,6 +1029,20 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
   L.push(`Certainty: *${compData.certainty?.score||0}%* — ${compData.certainty?.label||'?'}`);
   L.push('');
 
+  // Damage / condition warning
+  if (formulaData.damageTypes?.length) {
+    L.push(`🚨 *DAMAGE DETECTED IN CALL NOTES*`);
+    L.push(`Issues: ${formulaData.damageTypes.join(', ')}`);
+    if (formulaData.estRepairCost && formulaData.damageAdjValue != null) {
+      L.push(`Est. repair cost: *$${formulaData.estRepairCost.toLocaleString()}*`);
+      L.push(`Damage-adjusted As-Is: *${f(formulaData.damageAdjValue)}* _(comps value minus repair estimate)_`);
+      L.push(`_MAO should be based on damage-adj value, not the comps-only As-Is above._`);
+    } else {
+      L.push(`_No repair estimate in notes — get contractor bid before finalizing offer._`);
+    }
+    L.push('');
+  }
+
   // Active market pulse (Zillow)
   if (pulse) {
     const flipNote = pulse.flipListings > 0 ? ` · ⚡ ${pulse.flipListings} flip-priced` : '';
@@ -918,11 +1054,16 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
       L.push(`📈 *Comparable active listings:*`);
       pulse.topByPpsf.forEach((l, i) => {
         const addr      = l.address ? l.address.split(',')[0] : '—';
-        const staleTag  = l.stale ? ' ⚠️ 150+ DOM — price likely dropping' : '';
+        const staleTag  = l.stale
+          ? ` ⚠️ ${l.dom}+ DOM${l.realisticPrice ? ` — needs ~${f(l.realisticPrice)} to move` : ' — price likely dropping'}`
+          : '';
         const yrTag     = l.yearBuilt ? ` built ${l.yearBuilt}` : '';
         const condIcon  = l.condition === 'Updated' ? '✅' : l.condition === 'Partial' ? '🔶' : l.condition === 'Dated' ? '🔴' : '';
         const condTag   = l.condition ? ` · ${condIcon} ${l.condition}` : '';
-        const condNote  = l.conditionNote ? `\n      _↳ ${l.conditionNote}_` : '';
+        const arvSuffix = l.condition === 'Updated' ? ' — renovated/ARV-priced; as-is subject likely worth less' : '';
+        const condNote  = (l.conditionNote || arvSuffix)
+          ? `\n      _↳ ${l.conditionNote || ''}${arvSuffix}_`
+          : '';
         L.push(`  ${i+1}. ${addr} | ${l.sqft?l.sqft.toLocaleString()+'sf':'?sf'}${yrTag} · ${f(l.listPrice)} · $${l.ppsf}/sqft · DOM ${l.dom??'?'}${staleTag}${condTag}${condNote}`);
       });
 
@@ -1008,6 +1149,23 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
     L.push('');
   }
 
+  // Modern-era sold comps — 25+ yr newer than subject, excluded from As-Is avg, shown as ceiling
+  const mPool = compData.modernPool || [];
+  if (mPool.length > 0 && subject.yearBuilt) {
+    const mPpsf = mPool.filter(c => c.adjPpsf).map(c => c.adjPpsf);
+    const mAvg  = mPpsf.length ? Math.round(mPpsf.reduce((a, b) => a + b, 0) / mPpsf.length) : null;
+    L.push(`🏗️ *MODERN SOLD COMPS* _(25+ yr newer than subject — excluded from As-Is avg, ceiling reference only)_`);
+    if (mAvg) L.push(`Avg $${mAvg}/sqft adj — _these newer homes trade at a premium over the ${subject.yearBuilt} subject_`);
+    mPool.slice(0, 4).forEach((c, i) => {
+      const srcTag = c.zillowEnriched ? ' _[County+Zillow]_' : ' _[County]_';
+      L.push(
+        `${i+1}. ${c.address||'—'} | ${c.sqft}sf ${c.beds||'?'}bd/${c.baths||'?'}ba built ${c.yearBuilt||'?'} ` +
+        `${c.distanceMi != null ? c.distanceMi+'mi' : ''} · ${f(c.saleAmt)} ${c.saleDate} · $${c.adjPpsf}/sf adj${srcTag}`
+      );
+    });
+    L.push('');
+  }
+
   // New construction reference comps (same era, wider radius)
   const nc = compData.newConstrComps || [];
   if (nc.length) {
@@ -1089,7 +1247,13 @@ app.post('/analyze', async (req, res) => {
       });
     }
 
-    // 2b. Sqft found — note any missing specs so the user knows adjustments are partial
+    // 2b. Extract damage / condition signals from call notes (no API call — pure text parsing)
+    const conditionInfo = extractConditionNotes(callNotes);
+    if (conditionInfo.hasDamage) {
+      console.log(`[damage] detected: ${conditionInfo.damageTypes.join(', ')} | estRepairCost: ${conditionInfo.estRepairCost}`);
+    }
+
+    // 2c. Note any missing specs so the user knows adjustments are partial
     const missingSpecs = [
       !parsed.beds      ? 'beds'       : null,
       !parsed.baths     ? 'baths'      : null,
@@ -1302,6 +1466,29 @@ app.post('/analyze', async (req, res) => {
       );
     }
 
+    // 8c. Damage warning from call notes — adjust As-Is downward and flag prominently
+    if (conditionInfo.hasDamage) {
+      const dmgList = conditionInfo.damageTypes.join(', ');
+      if (conditionInfo.estRepairCost) {
+        const dmgAdjValue = asIsValue ? Math.round((asIsValue - conditionInfo.estRepairCost) / 1000) * 1000 : null;
+        compData.notes.push(
+          `🚨 DAMAGE in call notes: ${dmgList}. ` +
+          `Est. repair: $${conditionInfo.estRepairCost.toLocaleString()} → ` +
+          `Damage-adj As-Is: ${dmgAdjValue != null ? '$' + dmgAdjValue.toLocaleString() : 'N/A'} ` +
+          `(comps value minus repair estimate). MAO should reflect full repair cost.`
+        );
+        formulaData.damageTypes     = conditionInfo.damageTypes;
+        formulaData.estRepairCost   = conditionInfo.estRepairCost;
+        formulaData.damageAdjValue  = dmgAdjValue;
+      } else {
+        compData.notes.push(
+          `⚠️ DAMAGE noted in call notes: ${dmgList}. ` +
+          `No repair estimate given — get contractor bid before finalizing offer.`
+        );
+        formulaData.damageTypes = conditionInfo.damageTypes;
+      }
+    }
+
     // 9. Narrative + photo condition assessment — run in parallel (both are Anthropic calls)
     const [narrative, conditionMap] = await Promise.all([
       narrativeAgent(subject, compData, formulaData, pulse, callNotes),
@@ -1419,11 +1606,11 @@ app.get('/debug-zillow-sold', async (req, res) => {
 
 app.get('/health', (req, res) =>
   res.json({
-    status: 'ok', version: '3.5',
+    status: 'ok', version: '3.6',
     attom: !!ATTOM_KEY, zillow: !!RAPIDAPI_KEY, anthropic: !!ANTHROPIC_KEY,
     lastDeal: lastDeal ? { address: lastDeal.address, analyzedAt: lastDeal.analyzedAt } : null
   })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Deal Analyzer v3.5 (+ photo condition assessment: Updated/Partial/Dated via Haiku vision, parallel with narrative) on :${PORT}`));
+app.listen(PORT, () => console.log(`Deal Analyzer v3.6 (IQR distress filter, era-gap comp split, damage extraction, stronger vintage adj, stale DOM 90d, ARV flag) on :${PORT}`));
