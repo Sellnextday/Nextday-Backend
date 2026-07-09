@@ -769,6 +769,53 @@ function processComps(rawComps, subject, sqft, stateCode) {
 }
 
 // ══════════════════════════════════════════════════════
+// PROPSTREAM COMP CONVERTER
+// Converts PropStream internal API comp format → internal comp format
+// Used when bookmarklet sends comps directly, bypassing ATTOM
+// ══════════════════════════════════════════════════════
+
+function propstreamCompsToInternal(psComps) {
+  const now = Date.now();
+  return (psComps || []).map(c => {
+    const saleDateMs = typeof c.saleDate === 'number' ? c.saleDate
+                     : (c.saleDate ? new Date(c.saleDate).getTime() : null);
+    const monthsOld  = saleDateMs
+      ? Math.round((now - saleDateMs) / (1000 * 60 * 60 * 24 * 30.44) * 10) / 10
+      : null;
+    const saleDate   = saleDateMs ? new Date(saleDateMs).toISOString().split('T')[0] : null;
+    const addrObj    = c.address || {};
+    const streetAddr = addrObj.streetAddress || (typeof c.address === 'string' ? c.address : '');
+    const city       = addrObj.cityName || addrObj.city || '';
+    const state      = addrObj.stateCode || addrObj.state || '';
+    const fullAddr   = [streetAddr, city, state].filter(Boolean).join(', ');
+    const landUse    = c.landUse || '';
+    const propType   = landUse.toLowerCase().includes('single') ? 'SFR'
+                     : landUse.toLowerCase().includes('condo')  ? 'CONDO'
+                     : landUse.toLowerCase().includes('multi')  ? 'MULTI_FAMILY'
+                     : 'SFR';
+    return {
+      address:          fullAddr,
+      sqft:             c.squareFeet  || c.sqft   || null,
+      beds:             c.bedrooms    || c.beds    || null,
+      baths:            c.bathrooms   || c.baths   || null,
+      yearBuilt:        c.yearBuilt   || null,
+      saleAmt:          c.saleAmount  || c.saleAmt || null,
+      saleDate,
+      monthsOld,
+      distanceMi:       c.distanceFromSubject || c.distance || null,
+      propType,
+      lat:              c.latitude    || null,
+      lon:              c.longitude   || null,
+      priorSaleAmt:     null,
+      priorSaleDate:    null,
+      dom:              null,
+      zillowEnriched:   false,
+      propstreamSource: true
+    };
+  }).filter(c => c.saleAmt && c.sqft && c.saleAmt > 10000);
+}
+
+// ══════════════════════════════════════════════════════
 // PULL COMPS — 1 ATTOM call at max radius, filter client-side
 // ══════════════════════════════════════════════════════
 
@@ -1220,13 +1267,23 @@ function formatSlack(subject, compData, formulaData, narrative, pulse) {
 // ══════════════════════════════════════════════════════
 
 app.post('/analyze', async (req, res) => {
-  const { address, callNotes } = req.body || {};
+  const { address, callNotes, propstreamSubject, propstreamComps: psComps } = req.body || {};
   if (!address) return res.status(400).json({ error: 'address required' });
-  console.log('[analyze]', address);
+  const hasPropstream = psComps && psComps.length > 0;
+  console.log('[analyze]', address, hasPropstream ? `(PropStream: ${psComps.length} comps)` : '(ATTOM)');
 
   try {
     // 1. Parse subject specs from call notes
     const parsed = parseSubjectSpecs((callNotes || '') + ' ' + address);
+
+    // 1b. Fill missing specs from PropStream subject data (bookmarklet sends this)
+    if (propstreamSubject) {
+      if (!parsed.sqft      && propstreamSubject.sqft)      parsed.sqft      = propstreamSubject.sqft;
+      if (!parsed.beds      && propstreamSubject.beds)      parsed.beds      = propstreamSubject.beds;
+      if (!parsed.baths     && propstreamSubject.baths)     parsed.baths     = propstreamSubject.baths;
+      if (!parsed.yearBuilt && propstreamSubject.yearBuilt) parsed.yearBuilt = propstreamSubject.yearBuilt;
+      console.log(`[propstream-subject] sqft=${parsed.sqft} beds=${parsed.beds} baths=${parsed.baths} yr=${parsed.yearBuilt}`);
+    }
 
     // 2. Ask for specs if sqft is missing — sqft is required, everything else sharpens the number
     if (!parsed.sqft) {
@@ -1289,13 +1346,24 @@ app.post('/analyze', async (req, res) => {
     const isNonDisclosure = NON_DISCLOSURE_STATES.has(stateCode);
     if (isNonDisclosure) console.log(`[nonDisclosure] ${stateCode} is a non-disclosure state`);
 
-    // 4. ATTOM (1 call) + Zillow sold + Zillow active — all in parallel
-    const [compResult, zillowSoldData, activeListings] = await Promise.all([
-      pullComps(geo.lat, geo.lon, subject.propertyType, subject.sqft, subject.yearBuilt),
-      zillowSold(cityState),
-      zillowActiveListings(geo.lat, geo.lon, 2)
-    ]);
-    console.log(`[data] ATTOM:${compResult.comps.length} ZillowSold:${zillowSoldData.length} Active:${activeListings.length}`);
+    // 4. Comps + Zillow — use PropStream if bookmarklet sent them, else fall back to ATTOM
+    let compResult, zillowSoldData, activeListings;
+    if (hasPropstream) {
+      const internalComps = propstreamCompsToInternal(psComps);
+      compResult = { comps: internalComps, newConstrComps: [], flagged: internalComps.length < 3 };
+      [zillowSoldData, activeListings] = await Promise.all([
+        zillowSold(cityState),
+        zillowActiveListings(geo.lat, geo.lon, 2)
+      ]);
+      console.log(`[data] PropStream:${internalComps.length} ZillowSold:${zillowSoldData.length} Active:${activeListings.length}`);
+    } else {
+      [compResult, zillowSoldData, activeListings] = await Promise.all([
+        pullComps(geo.lat, geo.lon, subject.propertyType, subject.sqft, subject.yearBuilt),
+        zillowSold(cityState),
+        zillowActiveListings(geo.lat, geo.lon, 2)
+      ]);
+      console.log(`[data] ATTOM:${compResult.comps.length} ZillowSold:${zillowSoldData.length} Active:${activeListings.length}`);
+    }
 
     // 5. Cross-reference: fill in missing beds/baths/sqft from Zillow
     let enriched = enrichCompsWithZillow(compResult.comps, zillowSoldData);
@@ -1417,6 +1485,12 @@ app.post('/analyze', async (req, res) => {
         compData.notes.push('Fewer than 3 usable comps found — treat with caution');
       }
       compData.newConstrComps = newConstrEnriched;
+
+      if (hasPropstream) {
+        compData.notes.unshift(
+          `✅ PropStream MLS comps: ${psComps.length} pulled, ${compData.usable.length} passed quality filters`
+        );
+      }
 
       if (nonDisclosureMode === 'zillow-sold') {
         compData.notes.unshift(
@@ -1541,7 +1615,7 @@ app.post('/analyze', async (req, res) => {
         distanceMi: c.distanceMi,
         flipComp:   c.flipComp,
         isOutlier:  c.isOutlier,
-        source:     c.zillowEnriched ? 'County+Zillow' : 'County'
+        source:     c.propstreamSource ? 'PropStream' : (c.zillowEnriched ? 'County+Zillow' : 'County')
       })),
       pulse: pulse ? {
         count:       pulse.count,
